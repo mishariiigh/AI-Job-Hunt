@@ -1,0 +1,39 @@
+{
+  "name": "",
+  "email": "",
+  "phone": "",
+  "address": {
+    "street": "",
+    "city": "Oakville",
+    "province": "ON",
+    "postal_code": "",
+    "country": "Canada"
+  },
+  "location": "Oakville, Ontario, Canada",
+  "education": "Computer Programming Diploma, Algonquin College",
+  "experience_years": 4,
+  "career_direction": "AI Automation and software development",
+  "technical_interests": [
+    "Python",
+    "SQL",
+    "Azure",
+    "APIs",
+    "application support",
+    "cybersecurity",
+    "AI"
+  ],
+  "availability": {
+    "weekdays_after": "18:00",
+    "timezone": "America/Toronto",
+    "weekends": true
+  },
+  "desired_hours_per_week": [
+    20,
+    25
+  ],
+  "preferred_arrangement": "Fully remote",
+  "language": "English",
+  "french_required": false,
+  "resume_versions": [],
+  "notes": "Use existing resume and employment info as source of truth. Do not invent qualifications/certifications/employment history."
+}
