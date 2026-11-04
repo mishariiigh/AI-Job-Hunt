@@ -278,65 +278,51 @@ elif page == "Discover Jobs":
 
 elif page == "Recommended Jobs":
     st.title("Recommended Jobs")
-    st.caption("Eligibility gates are strict: unknown shift times or Canadian eligibility never count as confirmed.")
+    st.caption(
+        "Hard gates first: a job is a confirmed evening recommendation only when a shift "
+        "starting at or after 5:00 PM (America/Toronto), Canadian eligibility, acceptable "
+        "location, and no disqualifying requirements are all verified. The technical match "
+        "score never overrides a failed or unknown gate."
+    )
     jobs = tracker.get_jobs()
     if not jobs:
         st.info("No live job postings have been discovered yet. Use discovery or Manual Job Intake to add a current vacancy.")
     else:
         classified_jobs = [(job, classify_opportunity(job)) for job in jobs]
-        status_labels = [
-            "Confirmed Evening",
-            "Potential Evening",
-            "Schedule Conflict",
-            "Not Suitable",
-        ]
-        counts = Counter(
-            opportunity_status_label(result) for _, result in classified_jobs
-        )
-        cols = st.columns(4)
-        for column, label in zip(cols, status_labels):
+
+        def recommendation_category(job, result):
+            """Map opportunity status to one of the three display categories."""
+            if result["status"] == "confirmed_evening":
+                return "Confirmed Evening"
+            if result["status"] == "rejected":
+                return "Not Suitable"
+            return "Needs Verification"
+
+        category_order = ["Confirmed Evening", "Needs Verification", "Not Suitable"]
+        counts = Counter(recommendation_category(job, result) for job, result in classified_jobs)
+        cols = st.columns(3)
+        for column, label in zip(cols, category_order):
             column.metric(label, counts[label])
 
         with st.expander("Filters", expanded=True):
             c1, c2, c3 = st.columns(3)
-            status_filter = c1.selectbox(
-                "Opportunity status",
-                ["All", *status_labels],
-            )
-            min_score = c2.slider("Minimum profile match score", 0, 100, 0)
+            category_filter = c1.selectbox("Recommendation category", ["All", *category_order])
+            min_score = c2.slider("Minimum technical match score", 0, 100, 0)
             sources = sorted({str(job.get("source") or "Unknown") for job in jobs})
             source_filter = c3.selectbox("Source", ["All"] + sources)
             c4, c5 = st.columns(2)
-            category_filter = c4.selectbox(
-                "Match score category",
-                ["All", "Excellent match", "Strong match", "Possible match", "Weak match"],
-            )
-            query = c5.text_input("Search employer or job title")
-            display_limit = st.selectbox("Maximum postings to show", [25, 50, 100, "All"], index=1)
-
-        def category_for_score(score):
-            if score >= 85:
-                return "Excellent match"
-            if score >= 70:
-                return "Strong match"
-            if score >= 55:
-                return "Possible match"
-            return "Weak match"
+            query = c4.text_input("Search employer or job title")
+            display_limit = st.selectbox("Maximum postings per section", [10, 25, 50, "All"], index=1)
 
         filtered_jobs = []
         for job, result in classified_jobs:
             score = float(job.get("match_score") or 0)
-            category = category_for_score(score)
-            if (
-                status_filter != "All"
-                and opportunity_status_label(result) != status_filter
-            ):
+            category = recommendation_category(job, result)
+            if category_filter != "All" and category != category_filter:
                 continue
             if score < min_score:
                 continue
             if source_filter != "All" and (job.get("source") or "Unknown") != source_filter:
-                continue
-            if category_filter != "All" and category != category_filter:
                 continue
             if query and query.lower() not in f"{job.get('employer', '')} {job.get('job_title', '')}".lower():
                 continue
@@ -348,9 +334,8 @@ elif page == "Recommended Jobs":
             ),
             reverse=True,
         )
-        if display_limit != "All":
-            filtered_jobs = filtered_jobs[:display_limit]
-        st.caption(f"Showing {len(filtered_jobs)} posting(s) after filters.")
+
+        st.caption(f"{len(filtered_jobs)} posting(s) match these filters.")
 
         with st.expander("Match diagnostics"):
             if st.button("Recalculate all match scores"):
@@ -360,169 +345,216 @@ elif page == "Recommended Jobs":
                         matcher.save_match(job["id"], match_result)
                 st.success("Match scores recalculated.")
                 st.rerun()
-            st.info("Match scores are profile signals only; they never override a failed or unverified eligibility gate.")
+            st.info(
+                "Match scores are technical profile signals only. They never change which "
+                "category a job appears in or override a failed or unverified eligibility gate."
+            )
 
-        if not filtered_jobs:
-            if counts["Confirmed Evening"] == 0:
-                st.info(
-                    "No confirmed evening matches meet these filters. Potential evening "
-                    "opportunities and schedule conflicts remain separately labeled."
-                )
-            else:
-                st.info("No postings match the selected filters.")
         applications_by_job = {}
         for existing_application in tracker.get_applications():
             applications_by_job.setdefault(existing_application.get("job_id"), existing_application)
-        for job, result, score, category in filtered_jobs:
-            with st.container(border=True):
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.subheader(job.get("job_title") or "Untitled role")
-                    st.write(f"{job.get('employer') or 'Employer not listed'} · {job.get('location') or 'Location not listed'}")
-                if (job.get("source") or "").lower() == "remotive":
-                    st.caption(
-                        "Source: Remotive API · listings may be delayed by up to 24 hours."
-                    )
-                else:
-                    st.caption(f"Source: {job.get('source') or 'Unknown'}")
-                if job.get("last_verified_at"):
-                    st.caption(
-                        f"Last checked in source feed: {job['last_verified_at']} "
-                        f"· status: {job.get('listing_status') or 'unknown'}"
-                    )
-                if job.get("possible_repost_count", 1) > 1:
-                    st.caption(
-                        "Possible same-role repost or parallel requisition; postings are kept separate."
-                    )
-                with col2:
-                    st.metric("Profile match", f"{score:.0f}/100", category)
 
-                shift = result["evening"]
-                if shift["status"] == "confirmed_evening":
-                    shift_end = f"–{shift['end_time']}" if shift.get("end_time") else ""
-                    shift_kind = (
-                        "Confirmed overnight"
-                        if shift.get("schedule_type") == "confirmed_overnight"
-                        else "Confirmed evening"
+        for category in category_order:
+            category_jobs = [item for item in filtered_jobs if item[3] == category]
+            st.subheader(f"{category} ({len(category_jobs)})")
+            if category == "Confirmed Evening":
+                st.caption("All hard gates verified: qualifying evening shift, Canadian eligibility, acceptable location, no disqualifiers.")
+            elif category == "Needs Verification":
+                st.caption("Potentially suitable, but the schedule, eligibility, or another key detail is unverified. These are NOT confirmed evening opportunities.")
+            else:
+                st.caption("Verified incompatible with your requirements. Shown here and in filters for audit purposes.")
+            if not category_jobs:
+                st.info("No jobs currently in this category.")
+                continue
+            shown = category_jobs if display_limit == "All" else category_jobs[:display_limit]
+            for job, result, score, category in shown:
+                with st.container(border=True):
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        st.subheader(job.get("job_title") or "Untitled role")
+                        st.write(f"{job.get('employer') or 'Employer not listed'} · {job.get('location') or 'Location not listed'}")
+                    if (job.get("source") or "").lower() == "remotive":
+                        st.caption(
+                            "Source: Remotive API · listings may be delayed by up to 24 hours."
+                        )
+                    else:
+                        st.caption(f"Source: {job.get('source') or 'Unknown'}")
+                    if job.get("last_verified_at"):
+                        st.caption(
+                            f"Last checked in source feed: {job['last_verified_at']} "
+                            f"· status: {job.get('listing_status') or 'unknown'}"
+                        )
+                    if job.get("possible_repost_count", 1) > 1:
+                        st.caption(
+                            "Possible same-role repost or parallel requisition; postings are kept separate."
+                        )
+                    with col2:
+                        st.metric("Technical match", f"{score:.0f}/100", category)
+
+                    shift = result["evening"]
+                    if shift["status"] == "confirmed_evening":
+                        shift_end = f"–{shift['end_time']}" if shift.get("end_time") else ""
+                        shift_kind = (
+                            "Confirmed overnight"
+                            if shift.get("schedule_type") == "confirmed_overnight"
+                            else "Confirmed evening"
+                        )
+                        st.write(
+                            f"**Shift:** {shift_kind}, {shift['start_time']}{shift_end} "
+                            f"({shift['timezone']})"
+                        )
+                    else:
+                        schedule_labels = {
+                            "day_shift": "Day shift",
+                            "rotating_shift": "Rotating shift",
+                            "multiple_shift_options": "Multiple shift options",
+                            "timezone_unverified": "Timezone needs verification",
+                            "flexible": "Flexible schedule",
+                            "unknown": "Schedule unknown",
+                        }
+                        if shift.get("conflict"):
+                            label = "Schedule conflict"
+                        elif shift.get("schedule_type") == "needs_verification":
+                            label = "Evening mentioned, hours not stated"
+                        else:
+                            label = schedule_labels.get(shift.get("schedule_type"), "Schedule")
+                        shift_hours = (
+                            f" ({shift['start_time']}–{shift['end_time']})"
+                            if shift.get("start_time")
+                            else " (hours not stated)"
+                        )
+                        st.write(f"**Shift:** {label}{shift_hours} — {shift['reason']}")
+                    arrangement = result.get("location_arrangement", {})
+                    st.write(
+                        f"**Canadian eligibility:** {result['canadian_eligibility']['reason']}"
                     )
                     st.write(
-                        f"**Shift:** {shift_kind}, {shift['start_time']}{shift_end} "
-                        f"({shift['timezone']})"
-                    )
-                else:
-                    schedule_labels = {
-                        "day_shift": "Day shift",
-                        "rotating_shift": "Rotating shift",
-                        "multiple_shift_options": "Multiple shift options",
-                        "timezone_unverified": "Timezone needs verification",
-                        "flexible": "Flexible schedule",
-                        "unknown": "Schedule unknown",
-                        "needs_verification": "Schedule conflict",
-                    }
-                    label = schedule_labels.get(shift.get("schedule_type"), "Schedule")
-                    st.write(f"**Shift:** {label} — {shift['reason']}")
-                st.write(
-                    f"**Location eligibility:** {result['canadian_eligibility']['reason']} · "
-                    f"{'Remote' if job.get('remote') else 'In person / hybrid'}"
-                )
-                st.write(
-                    f"**Hours / salary:** {job.get('employment_type') or 'Not listed'} · "
-                    f"{job.get('salary') or 'Not listed'}"
-                )
-                status_label = opportunity_status_label(result)
-                if status_label == "Confirmed Evening":
-                    st.success(
-                        "Confirmed Evening — schedule and Canadian eligibility checks passed."
-                    )
-                elif status_label in {"Schedule Conflict", "Potential Evening"}:
-                    st.warning(f"{status_label}: " + "; ".join(result["reasons"]))
-                else:
-                    st.error(f"{status_label}: " + "; ".join(result["reasons"]))
-
-                if job.get("match_explanation"):
-                    with st.expander("Why this profile score"):
-                        st.write(job["match_explanation"])
-                        st.caption("This automated score is not a qualification decision.")
-                application_for_job = applications_by_job.get(job["id"])
-                prepare_col, action_col, analysis_col = st.columns([1.5, 1, 1])
-                if job.get("job_url"):
-                    posting_link_label = (
-                        "View Remotive listing"
-                        if (job.get("source") or "").lower() == "remotive"
-                        else "View employer posting"
-                    )
-                    action_col.link_button(posting_link_label, job["job_url"])
-                if application_for_job:
-                    if prepare_col.button(
-                        "Open existing draft",
-                        key=f"open_application_{job['id']}",
-                    ):
-                        st.session_state["application_id"] = application_for_job["id"]
-                        st.session_state["review_application_selector"] = application_for_job["id"]
-                        st.session_state["apps_sub"] = "Application Review"
-                        st.session_state["navigation_target"] = "My Applications"
-                        st.rerun()
-                    if result["status"] != "rejected" and prepare_col.button(
-                        "Create another version",
-                        key=f"new_application_version_{job['id']}",
-                    ):
-                        from tracking.application_workflow import (
-                            ApplicationWorkflowError,
-                            prepare_application_draft,
+                        f"**Work arrangement:** {'Remote' if arrangement.get('remote') else 'In person / hybrid'}"
+                        f" · location: {arrangement.get('location') or job.get('location') or 'not stated'}"
+                        + (
+                            " (within Oakville/Mississauga/Toronto area)"
+                            if arrangement.get("local_area")
+                            else "" if arrangement.get("remote") else " (outside preferred area)"
                         )
-                        try:
-                            prepared = prepare_application_draft(
-                                job["id"], allow_new_version=True, tracker=tracker
+                    )
+                    st.write(
+                        f"**Hours / salary:** {job.get('employment_type') or 'Not listed'} · "
+                        f"{job.get('salary') or 'Not listed'}"
+                    )
+                    match_skills = [
+                        token.replace("Matched skills: ", "").strip()
+                        for token in (job.get("match_explanation") or "").split("; ")
+                        if token.startswith("Matched skills:")
+                    ]
+                    if match_skills:
+                        st.write(f"**Main matching skills:** {match_skills[0]}")
+                    status_label = opportunity_status_label(result)
+                    if status_label == "Confirmed Evening":
+                        st.success(
+                            "CONFIRMED EVENING — all hard gates verified (schedule, Canadian eligibility, location)."
+                        )
+                    else:
+                        st.warning(
+                            f"{category} — NOT a confirmed evening opportunity. Reasons: "
+                            + "; ".join(result["reasons"])
+                        )
+                    if job.get("match_explanation"):
+                        with st.expander("Why this job is in this category"):
+                            st.write("**Technical score explanation:**")
+                            st.write(job["match_explanation"])
+                            st.write("**Gate status (separate from technical score):**")
+                            st.write(f"- Schedule: {shift['status']} — {shift['reason']}")
+                            st.write(f"- Canadian eligibility: {result['canadian_eligibility']['status']} — {result['canadian_eligibility']['reason']}")
+                            st.write(f"- Listing status: {result.get('listing_status') or 'unknown'}")
+                            st.caption(
+                                "The technical match score never overrides a failed or unknown gate. "
+                                "This automated score is not a qualification decision."
                             )
-                            st.session_state["application_id"] = prepared["application"]["id"]
-                            st.session_state["review_application_selector"] = prepared["application"]["id"]
+                    application_for_job = applications_by_job.get(job["id"])
+                    prepare_col, action_col, analysis_col = st.columns([1.5, 1, 1])
+                    if job.get("job_url"):
+                        posting_link_label = (
+                            "View Remotive listing"
+                            if (job.get("source") or "").lower() == "remotive"
+                            else "View employer posting"
+                        )
+                        action_col.link_button(posting_link_label, job["job_url"])
+                    if application_for_job:
+                        if prepare_col.button(
+                            "Open existing draft",
+                            key=f"open_application_{job['id']}",
+                        ):
+                            st.session_state["application_id"] = application_for_job["id"]
+                            st.session_state["review_application_selector"] = application_for_job["id"]
                             st.session_state["apps_sub"] = "Application Review"
                             st.session_state["navigation_target"] = "My Applications"
                             st.rerun()
-                        except ApplicationWorkflowError as error:
-                            st.error(str(error))
-                elif result["status"] != "rejected":
-                    label = (
-                        "Prepare Application"
-                        if result["status"] == "confirmed_evening"
-                        else "Prepare blocked draft"
-                    )
-                    if prepare_col.button(label, key=f"prepare_application_{job['id']}"):
-                        from tracking.application_workflow import (
-                            ApplicationWorkflowError,
-                            prepare_application_draft,
+                        if result["status"] != "rejected" and prepare_col.button(
+                            "Create another version",
+                            key=f"new_application_version_{job['id']}",
+                        ):
+                            from tracking.application_workflow import (
+                                ApplicationWorkflowError,
+                                prepare_application_draft,
+                            )
+                            try:
+                                prepared = prepare_application_draft(
+                                    job["id"], allow_new_version=True, tracker=tracker
+                                )
+                                st.session_state["application_id"] = prepared["application"]["id"]
+                                st.session_state["review_application_selector"] = prepared["application"]["id"]
+                                st.session_state["apps_sub"] = "Application Review"
+                                st.session_state["navigation_target"] = "My Applications"
+                                st.rerun()
+                            except ApplicationWorkflowError as error:
+                                st.error(str(error))
+                    elif result["status"] != "rejected":
+                        label = (
+                            "Prepare Application"
+                            if result["status"] == "confirmed_evening"
+                            else "Prepare blocked draft"
                         )
-                        try:
-                            prepared = prepare_application_draft(job["id"], tracker=tracker)
-                            st.session_state["application_id"] = prepared["application"]["id"]
-                            st.session_state["review_application_selector"] = prepared["application"]["id"]
-                            st.session_state["apps_sub"] = "Application Review"
-                            st.session_state["navigation_target"] = "My Applications"
-                            st.rerun()
-                        except ApplicationWorkflowError as error:
-                            st.error(str(error))
-                else:
-                    prepare_col.caption("Rejected jobs cannot be prepared.")
-                if analysis_col.button("Analyze eligibility", key=f"analyze_{job['id']}"):
-                    if result["status"] == "confirmed_evening":
-                        analysis = matcher.unified_suitability(dict(job))
+                        if prepare_col.button(label, key=f"prepare_application_{job['id']}"):
+                            from tracking.application_workflow import (
+                                ApplicationWorkflowError,
+                                prepare_application_draft,
+                            )
+                            try:
+                                prepared = prepare_application_draft(job["id"], tracker=tracker)
+                                st.session_state["application_id"] = prepared["application"]["id"]
+                                st.session_state["review_application_selector"] = prepared["application"]["id"]
+                                st.session_state["apps_sub"] = "Application Review"
+                                st.session_state["navigation_target"] = "My Applications"
+                                st.rerun()
+                            except ApplicationWorkflowError as error:
+                                st.error(str(error))
                     else:
-                        analysis = {
-                            "eligible": False,
-                            "reason": "; ".join(result["reasons"]),
-                        }
-                    st.session_state[f"eligibility_analysis_{job['id']}"] = analysis
-                analysis = st.session_state.get(f"eligibility_analysis_{job['id']}")
-                if analysis:
-                    if analysis.get("eligible"):
-                        st.info(
-                            f"Requirement signal score: {analysis.get('overall_score', 0):.0f}/100 "
-                            f"({analysis.get('category')}). Review the full posting before applying."
-                        )
-                        if analysis.get("mandatory_gaps"):
-                            st.warning("Potential gaps to verify: " + "; ".join(analysis["mandatory_gaps"]))
-                    else:
-                        st.warning(f"Eligibility analysis: {analysis.get('reason')}. This is not an approval to apply.")
+                        prepare_col.caption("Rejected jobs cannot be prepared.")
+                    if analysis_col.button("Analyze eligibility", key=f"analyze_{job['id']}"):
+                        if result["status"] == "confirmed_evening":
+                            analysis = matcher.unified_suitability(dict(job))
+                        else:
+                            analysis = {
+                                "eligible": False,
+                                "reason": "; ".join(result["reasons"]),
+                            }
+                        st.session_state[f"eligibility_analysis_{job['id']}"] = analysis
+                    analysis = st.session_state.get(f"eligibility_analysis_{job['id']}")
+                    if analysis:
+                        if analysis.get("eligible"):
+                            st.info(
+                                f"Requirement signal score: {analysis.get('overall_score', 0):.0f}/100 "
+                                f"({analysis.get('category')}). Review the full posting before applying."
+                            )
+                            if analysis.get("mandatory_gaps"):
+                                st.warning("Potential gaps to verify: " + "; ".join(analysis["mandatory_gaps"]))
+                            if analysis.get("requirements_requiring_review"):
+                                st.caption(
+                                    "Transferable / unverified requirements: "
+                                    + "; ".join(analysis["requirements_requiring_review"])
+                                )
+                        else:
+                            st.warning(f"Eligibility analysis: {analysis.get('reason')}. This is not an approval to apply.")
 elif page == "Application Review":
     st.title("Application Review")
     from tracking.application_workflow import (

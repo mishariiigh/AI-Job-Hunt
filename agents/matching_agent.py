@@ -10,12 +10,12 @@ class MatchingAgent:
     def __init__(self, profile=None):
         self.profile = profile or self.load_profile()
         self.weights = {
-            'technical_skills': 0.25,
-            'relevant_experience': 0.20,
-            'education': 0.10,
-            'schedule_compatibility': 0.20,
-            'remote_location': 0.15,
-            'employment_type_hours': 0.10
+            # Technical-only score: schedule, location and eligibility gates are
+            # evaluated separately in job_classifier and are never scored here.
+            'technical_skills': 0.40,
+            'relevant_experience': 0.30,
+            'education': 0.15,
+            'employment_type_hours': 0.15
         }
         self.allow_ai = os.getenv('ALLOW_AI_MATCHING', 'false').lower() == 'true'
         self.allow_ai_data = os.getenv('ALLOW_AI_DATA_SHARING', 'false').lower() == 'true'
@@ -46,36 +46,36 @@ class MatchingAgent:
         return max(0.0, min(100.0, float(value)))
 
     def deterministic_match(self, job):
+        # Technical profile score ONLY. Hard gates (schedule, Canadian
+        # eligibility, location, mandatory qualifications) are evaluated
+        # separately (see agents/job_classifier.classify_opportunity) and can
+        # never be overridden by this score.
         score = 0.0
         explanation = []
         hard_disqualifiers = []
         required_matched = []
         missing = []
-
         desc = (job.get('description') or '')
         title = (job.get('job_title') or '')
         text = f"{title} {desc}".lower()
         location = (job.get('location') or '').lower()
-
-        # French check
+        # Mandatory French is a hard disqualifier (gate, not score)
         if 'french required' in text or 'français requis' in text or 'bilingual french required' in text or 'mandatory french' in text:
             hard_disqualifiers.append('Mandatory French requirement')
 
-        # Remote/location
-        remote_ok = False
+        # Location/arrangement — gate signal only, scored in priority ranking
+        # (opportunity_priority_key), never as a technical-score component.
         if job.get('remote') == 1 and job.get('canada_eligible') == 1:
-            remote_ok = True
-            score += self.weights['remote_location'] * 100
             explanation.append('Remote/location eligible (confirmed)')
+        elif job.get('remote') == 1:
+            explanation.append('Remote/location: needs review (Canadian eligibility unknown)')
         else:
-            if job.get('remote') == 1:
-                explanation.append('Remote/location: needs review (Canadian eligibility unknown)')
-            else:
-                if 'usa' in location or 'united states' in location:
-                    hard_disqualifiers.append('Geographic restriction excludes candidate')
-                explanation.append('Remote/location: needs review')
+            if 'usa' in location or 'united states' in location:
+                hard_disqualifiers.append('Geographic restriction excludes candidate')
+            explanation.append('Remote/location: needs review')
 
-        # Technical skills
+        # Technical skills — keyword evidence only; a missing keyword is NOT
+        # proof of a missing skill, so it is a review item, not a disqualifier.
         skills = self.profile.get('technical_interests', [])
         matched_skills = []
         for s in skills:
@@ -87,7 +87,7 @@ class MatchingAgent:
             required_matched.extend(matched_skills)
             explanation.append(f'Matched skills: {", ".join(matched_skills)}')
         else:
-            missing.append('Required technical skills not evident')
+            missing.append('No technical keyword evidence (verify against resume before concluding a gap)')
             explanation.append('Limited skill keyword matches')
 
         # Experience
@@ -104,29 +104,19 @@ class MatchingAgent:
         else:
             missing.append('Education requirement not met')
 
-        # Schedule
-        sched = job.get('schedule_classification') or {}
-        if isinstance(sched, str):
-            try:
-                sched = json.loads(sched)
-            except Exception:
-                sched = {}
-        if sched.get('confirmed_evening'):
-            score += self.weights['schedule_compatibility'] * 100
-            explanation.append('Schedule compatible (confirmed evening)')
-        elif sched.get('schedule_type') == 'unknown':
-            explanation.append('Schedule unknown - review required')
-        else:
-            if sched.get('schedule_type') == 'other' and not sched.get('confirmed_evening'):
-                hard_disqualifiers.append('Incompatible working hours')
-            explanation.append('Schedule may not fit preferences')
-
-        # Employment type/hours
-        if job.get('employment_type'):
+        # Employment type/hours — preference signal only (part-time preferred,
+        # full-time eligible but ranked lower). Schedule gates live in
+        # job_classifier.classify_evening_eligibility / classify_opportunity.
+        schedule_text = f"{job.get('employment_type') or ''} {desc}".lower()
+        if re.search(r"\bpart[- ]time\b|\b20\s*(?:-|to)\s*25\s+hours?\b", schedule_text):
+            score += self.weights['employment_type_hours'] * 100
+            explanation.append('Part-time hours align with preference (20-25 hours/week)')
+        elif re.search(r"\bfull[- ]time\b", schedule_text):
             score += self.weights['employment_type_hours'] * 100 * 0.5
+            explanation.append('Full-time: eligible but ranked below part-time')
         else:
             score += self.weights['employment_type_hours'] * 100 * 0.3
-        explanation.append('Employment type/hours reviewed')
+            explanation.append('Employment type/hours not stated')
 
         score = self._normalize(score)
 
@@ -282,6 +272,35 @@ class MatchingAgent:
         "APIs": r"\bAPIs?\b",
         "Docker": r"\bDocker\b",
         "cybersecurity": r"\bcyber[\s-]?security\b",
+        # Specialist role requirements that general SQL/programming knowledge
+        # must NOT automatically satisfy. Matched only with explicit evidence.
+        "database administration": (
+            r"\b(?:database\s+admi\w*|DBA|database\s+relia\w*|"
+            r"relational\s+database\s+systems?\s+(?:admin\w*|experience)\b|"
+            r"SQL\s+Server\s+(?:admin\w*|experience)\b|PostgreSQL\s+(?:admin\w*|experience)\b)"
+        ),
+        "production reliability / SRE": (
+            r"\b(?:site\s+reliability|SRE|production\s+reliability|on-call\s+rotations?|"
+            r"root-cause\s+analysis|incident\s+management)\b"
+        ),
+        "database replication / HA / DR": (
+            r"\b(?:replication|high\s+availability|disaster\s+recovery|failover|backups?\s+and\s+recovery)\b"
+        ),
+        "query/schema performance tuning": (
+            r"\b(?:performance\s+tuning|query\s+performance|query\s+optimization|schema/design\s+improvements?|index\s+optimi[sz]ation)\b"
+        ),
+        "cloud infrastructure experience": (
+            # Direct evidence requires operational infrastructure language,
+            # not a bare cloud/AWS/Azure mention.
+            r"\b(?:cloud\s+infrastructure|cloud\s+platforms?|"
+            r"(?:deploy(?:ed|ing|ment)?|manage[dr]?|operat(?:e|ed|ing)|provision(?:ed|ing)?|"
+            r"administer(?:ed)?)\s+.{0,30}\b(?:azure|aws|gcp|cloud)|"
+            r"(?:azure|aws|gcp)\s+.{0,30}\b(?:infra\w*|virtual\s+machines?|resource\s+groups?|"
+            r"subnets?|networking|devops|kubernetes|containers?))\b"
+        ),
+        "infrastructure-as-code (Ansible/Terraform)": (
+            r"\b(?:Ansible|Terraform|infrastructure\s+as\s+code|IaC)\b"
+        ),
     }
 
     @staticmethod
@@ -505,9 +524,27 @@ class MatchingAgent:
                 )
 
         related_patterns = {
+            # "Azure" itself stays a generic skill: generic cloud/AWS/Google
+            # Cloud familiarity legitimately transfers to Azure familiarity.
             "Azure": r"\b(?:cloud|AWS|Google Cloud)\b",
             "networking/TCP/IP": r"\b(?:network support|network troubleshooting|DNS|routers?)\b",
             "RF scanners/peripherals": r"\b(?:peripheral support|hardware support|printers?)\b",
+            # Specialist requirements require OPERATIONAL evidence, not generic
+            # keyword familiarity. Generic "SQL" or "database" mentions do NOT
+            # establish database administration; cloud familiarity does NOT
+            # establish cloud infrastructure experience.
+            "database administration": (
+                r"\b(?:database\s+(?:admin\w*|operations?|dba)|DBA\b|"
+                r"(?:manage[dr]?|maintain(?:ed)?|administer(?:ed)?|supported?)\s+"
+                r"(?:production\s+)?(?:sql\s+server|postgresql|mysql|oracle|"
+                r"relational\s+databases?|database\s+(?:servers?|systems?|instances?)))\b"
+            ),
+            "production reliability / SRE": (
+                r"\b(?:production\s+support|application\s+support|troubleshoot\w*|"
+                r"incident\s+response|on-call|system\s+monitoring|root[- ]cause)\b"
+            ),
+            # No transferable mapping: only direct Demonstrated evidence of
+            # cloud infrastructure operations qualifies.
         }
         related = related_patterns.get(requirement)
         if related:

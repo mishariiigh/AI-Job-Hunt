@@ -494,11 +494,19 @@ def test_opportunity_remote_canada_with_exact_evening_start_is_confirmed():
 
 def test_opportunity_rejects_nonlocal_in_person_job():
     result = classify_opportunity({
-        'location':'Toronto, Ontario',
+        'location':'Ottawa, Ontario',
         'remote':0,
         'description':'Shift: 5 PM - 10 PM.',
     })
     assert result['status'] == 'rejected'
+    # Toronto is inside the acceptable geographic area
+    toronto = classify_opportunity({
+        'location':'Toronto, Ontario',
+        'remote':0,
+        'description':'Shift: 5 PM - 10 PM.',
+        'listing_status': 'active_on_source',
+    })
+    assert toronto['status'] == 'confirmed_evening'
 
 
 def test_schedule_categories_keep_nights_rotations_flexibility_and_day_labels_distinct():
@@ -535,13 +543,16 @@ def test_schedule_categories_keep_nights_rotations_flexibility_and_day_labels_di
 def test_canadian_cities_are_recognized_but_unapproved_in_person_city_is_rejected():
     assert canadian_eligibility({"location": "Toronto"})["status"] == "confirmed_compatible"
     result = classify_opportunity({
-        "location": "Toronto, Ontario",
+        "location": "Ottawa, Ontario",
         "remote": 0,
         "description": "Shift 5 PM - 10 PM",
         "listing_status": "active_on_source",
     })
     assert result["status"] == "rejected"
-    assert any("outside Oakville and Mississauga" in reason for reason in result["reasons"])
+    assert any(
+        "outside Oakville, Mississauga, and Toronto" in reason
+        for reason in result["reasons"]
+    )
 
 
 def test_freshness_and_missing_source_status_block_current_match_claims():

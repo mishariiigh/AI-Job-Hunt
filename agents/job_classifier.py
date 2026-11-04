@@ -796,9 +796,13 @@ def classify_opportunity(job, schedule_resolution=None):
         blockers.append("French is a mandatory requirement")
 
     location = _text(job.get("location"))
-    local_location = bool(re.search(r"\b(?:oakville|mississauga)\b", location))
+    local_location = bool(
+        re.search(r"\b(?:oakville|mississauga|toronto)\b", location, re.I)
+    )
     if not _is_remote(job) and not local_location:
-        blockers.append("In-person or hybrid location is outside Oakville and Mississauga")
+        blockers.append(
+            "In-person or hybrid location is outside Oakville, Mississauga, and Toronto"
+        )
 
     if blockers:
         status = "rejected"
@@ -810,11 +814,20 @@ def classify_opportunity(job, schedule_resolution=None):
         status = "confirmed_evening"
         reasons = ["Canadian eligibility and a shift starting at or after 5 PM are confirmed"]
 
+    location_arrangement = {
+        "remote": bool(_is_remote(job)),
+        "local_area": local_location,
+        "status": (
+            "remote" if _is_remote(job) else "local_area" if local_location else "outside_area"
+        ),
+        "location": location or "not stated",
+    }
     return {
         "status": status,
         "reasons": reasons,
         "evening": evening,
         "canadian_eligibility": canada,
+        "location_arrangement": location_arrangement,
         "listing_status": listing_status or "unknown",
     }
 
@@ -872,7 +885,7 @@ def opportunity_priority_key(job, opportunity=None, profile_score=None):
 
     location = _text(job.get("location"))
     remote = _is_remote(job) or "remote" in location
-    local = bool(re.search(r"\b(?:oakville|mississauga)\b", location))
+    local = bool(re.search(r"\b(?:oakville|mississauga|toronto)\b", location))
     arrangement_rank = 2 if remote else 1 if local else 0
     schedule_text = (
         f"{_text(job.get('employment_type'))} {_text(job.get('description'))}"
