@@ -25,7 +25,7 @@ def _save(items):
         json.dump(items, f, indent=2)
 
 
-def add_resume(filename, path, text, name=None, parsed_json=None):
+def add_resume(filename, path, text, name=None, parsed_json=None, import_sha256=None):
     _ensure_dirs()
     items = _load()
     rid = str(uuid.uuid4())
@@ -38,6 +38,8 @@ def add_resume(filename, path, text, name=None, parsed_json=None):
         "uploaded_at": datetime.datetime.now().isoformat(),
         "default": len(items) == 0,
     }
+    if import_sha256:
+        resume_entry["import_sha256"] = import_sha256
     if parsed_json is not None:
         resume_entry["parsed_json"] = parsed_json
         # Save parsed JSON to file

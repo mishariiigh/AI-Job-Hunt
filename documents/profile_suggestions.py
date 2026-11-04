@@ -16,7 +16,10 @@ def _save(items):
         json.dump(items, f, indent=2)
 
 def create_suggestions(profile, resume_text, resume_name):
-    items = []
+    existing = _load()
+    if any(i.get("resume")==resume_name for i in existing):
+        return existing
+    items = list(existing)
     text = resume_text or ""
     tlow = text.lower()
     # skill suggestions: profile skills not found? propose skills found in resume not in profile
