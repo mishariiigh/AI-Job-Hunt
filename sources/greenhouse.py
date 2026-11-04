@@ -1,6 +1,7 @@
 import requests
 from typing import List, Dict
 from datetime import datetime
+from sources.date_utils import normalize_source_timestamp
 
 
 class GreenhouseSource:
@@ -30,15 +31,23 @@ class GreenhouseSource:
                 result['error'] = f'Invalid JSON: {e}'
                 return result
             
-            jobs_list = data.get('jobs', []) if isinstance(data, dict) else []
+            if not isinstance(data, dict) or not isinstance(data.get('jobs'), list):
+                result['status'] = 'error'
+                result['error'] = 'Unexpected response format: jobs must be a list'
+                return result
+
+            jobs_list = data['jobs']
+            malformed_records = 0
             for j in jobs_list:
                 if not isinstance(j, dict):
+                    malformed_records += 1
                     continue
                 location = j.get('location') or {}
                 loc_name = location.get('name', '') if isinstance(location, dict) else str(location)
                 desc = j.get('content') or j.get('description') or ''
                 job_url = j.get('absolute_url') or j.get('url') or ''
                 if not job_url:
+                    malformed_records += 1
                     continue
                 employer = j.get('company_name') or j.get('company') or board_token.strip()
                 result['jobs'].append({
@@ -46,6 +55,7 @@ class GreenhouseSource:
                     'job_title': j.get('title') or '',
                     'job_url': job_url,
                     'source': 'greenhouse',
+                    'source_feed': board_token.strip(),
                     'description': str(desc),
                     'location': loc_name,
                     'department': j.get('departments', [{}])[0].get('name', '') if j.get('departments') else '',
@@ -55,11 +65,20 @@ class GreenhouseSource:
                     'employment_type': '',
                     'experience_required': '',
                     'education_required': '',
-                    'posting_date': j.get('updated_at') or j.get('created_at') or j.get('first_published'),
+                    'posting_date': normalize_source_timestamp(
+                        j.get('first_published') or j.get('created_at')
+                    ),
+                    'source_updated_at': j.get('updated_at'),
                     'deadline': j.get('close_date') or '',
                     'retrieved_at': datetime.now().isoformat(),
-                    'last_checked': datetime.now().isoformat()
+                    'last_checked': datetime.now().isoformat(),
+                    'listing_status': 'active_on_source',
                 })
+            if malformed_records:
+                result['status'] = 'error'
+                result['error'] = (
+                    f'Source snapshot incomplete: skipped {malformed_records} malformed posting records'
+                )
             result['retrieved'] = len(result['jobs'])
             return result
         except requests.exceptions.Timeout:

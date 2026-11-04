@@ -1,9 +1,39 @@
+import re
 from sources.greenhouse import GreenhouseSource
 from sources.lever import LeverSource
 from sources.job_bank import JobBankSource
 from sources.employer_sites import EmployerSitesSource
+from sources.remotive import RemotiveSource
 from tracking.application_tracker import ApplicationTracker
 from datetime import datetime
+from agents.job_classifier import (
+    canadian_eligibility,
+    classify_evening_eligibility,
+    french_is_mandatory,
+)
+
+
+_TARGET_ROLE_PATTERN = re.compile(
+    r"\b(?:it|support|help desk|helpdesk|service desk|software|developer|"
+    r"programmer|python|java|javascript|cloud|azure|cybersecurity|security|"
+    r"network|devops|sre|site reliability|noc|soc|automation|technical|application|"
+    r"systems|ai|artificial intelligence|"
+    r"technical operations?|it operations?)\b",
+    re.IGNORECASE,
+)
+
+
+def job_category(job_title):
+    title = str(job_title or "").lower()
+    if any(term in title for term in ("support", "help desk", "helpdesk", "service desk")):
+        return "IT and application support"
+    if any(term in title for term in ("cybersecurity", "security", "soc")):
+        return "Cybersecurity and security support"
+    if any(term in title for term in ("cloud", "azure", "network", "devops", "sre", "noc", "systems")):
+        return "Cloud, infrastructure and technical operations"
+    if re.search(r"\b(?:automation|artificial intelligence|ai)\b", title):
+        return "AI automation and technical operations"
+    return "Software development"
 
 
 class DiscoveryAgent:
@@ -12,77 +42,39 @@ class DiscoveryAgent:
         self.lever = LeverSource()
         self.job_bank = JobBankSource()
         self.employer = EmployerSitesSource()
+        self.remotive = RemotiveSource()
         self.tracker = ApplicationTracker()
     
     def is_canadian_remote(self, job):
-        loc = (job.get('location') or '').lower()
-        desc = (job.get('description') or '').lower()
-        country = (job.get('country') or '').upper()
-        workplace = (job.get('workplace_type') or '').lower()
-        other_countries = ['remote - usa', 'united states', ' usa', ', usa', 'uk only', 'australia only']
-        if any(c in loc for c in other_countries) and 'canada' not in loc:
-            # explicit US-only restriction
-            if 'canada' not in desc:
-                return False
-        if country == 'CA':
-            return True
-        if country == 'US':
-            if 'canada' in desc or 'canadian' in desc:
-                return True
-            if 'us only' in desc or 'united states only' in desc or 'us-only' in desc:
-                return False
-            # unknown/ambiguous
+        eligibility = canadian_eligibility(job)
+        if eligibility["status"] == "incompatible":
             return False
-        if 'canada' in loc or 'canadian' in desc:
-            return True
-        canadian_cities = ['toronto', 'vancouver', 'montreal', 'calgary', 'ottawa', 'edmonton', 'winnipeg', 'halifax']
-        if any(city in loc for city in canadian_cities):
-            return True
-        # remote ambiguous
-        if 'canada-wide' in desc or 'canada wide' in desc:
-            return True
-        if workplace == 'remote' and ('canada' in desc or 'canadian' in desc):
-            return True
-        return False
+        location = str(job.get("location") or "").lower()
+        remote = (
+            job.get("remote") in (1, True, "1", "true", "yes", "remote")
+            or str(job.get("workplace_type") or "").lower() in {"remote", "hybrid"}
+            or "remote" in location
+        )
+        local = bool(re.search(r"\b(?:oakville|mississauga)\b", location))
+        return remote or local
 
     def classify_schedule(self, job):
-        text = f"{job.get('shift','')} {job.get('description','')} {job.get('job_title','')} {job.get('employment_type','')}".lower()
-        evening_keywords = ['evening', 'after 6', 'after six', '18:00', '6 pm', '6pm', 'late shift']
-        weekend_keywords = ['weekend']
-        flexible_keywords = ['flexible']
-        part_time_keywords = ['part-time', 'part time', '20-25', '20 hours', '25 hours']
-        
-        confirmed_evening = any(k in text for k in evening_keywords)
-        confirmed_weekend = any(k in text for k in weekend_keywords)
-        flexible = any(k in text for k in flexible_keywords)
-        part_time = any(k in text for k in part_time_keywords)
-        
-        if confirmed_evening:
-            schedule_type = 'confirmed_evening'
-        elif confirmed_weekend and not confirmed_evening:
-            schedule_type = 'confirmed_weekend'
-        elif flexible:
-            schedule_type = 'flexible'
-        elif job.get('shift') == 'unknown' or ('shift' not in job or job.get('shift') == ''):
-            schedule_type = 'unknown'
-        else:
-            schedule_type = 'other'
-        
+        classified = classify_evening_eligibility(job)
+        text = f"{job.get('description', '')} {job.get('employment_type', '')}".lower()
         return {
-            'schedule_type': schedule_type,
-            'confirmed_evening': confirmed_evening,
-            'confirmed_weekend': confirmed_weekend,
-            'flexible': flexible,
-            'part_time': part_time
+            **classified,
+            "confirmed_evening": classified["status"] == "confirmed_evening",
+            "confirmed_weekend": bool(
+                re.search(r"\b(?:weekends?|saturdays?|sundays?)\b", text)
+            ),
+            "flexible": classified["schedule_type"] == "flexible",
+            "part_time": bool(
+                re.search(r"\bpart[- ]time\b|\b20\s*[-–]\s*25\s+hours?\b", text)
+            ),
         }
     
     def has_evening_shift(self, job):
-        sched = self.classify_schedule(job)
-        if sched['schedule_type'] == 'unknown':
-            return True
-        if sched['confirmed_evening'] or sched['flexible'] or sched['part_time']:
-            return True
-        return False
+        return classify_evening_eligibility(job)["status"] == "confirmed_evening"
     
     def is_expired(self, job):
         deadline = job.get('deadline')
@@ -103,21 +95,17 @@ class DiscoveryAgent:
         return False
     
     def filter_job(self, job):
-        if self.is_french_required(job):
+        if french_is_mandatory(job):
             return False, "French required"
         if not self.is_canadian_remote(job):
             return False, "Not Canadian remote / restricted to other region"
         if self.is_expired(job):
             return False, "Expired"
-        if self.tracker.job_exists(job.get('job_url', '')):
-            return False, "Duplicate"
-        sched = self.classify_schedule(job)
-        job['schedule_classification'] = sched
-        if sched['schedule_type'] == 'unknown':
-            return True, "Passed"
-        if sched['confirmed_evening'] or sched['flexible'] or sched['part_time']:
-            return True, "Passed"
-        return False, "Schedule conflict"
+        if not _TARGET_ROLE_PATTERN.search(str(job.get("job_title") or "")):
+            return False, "Outside target technical job families"
+        job["job_category"] = job_category(job.get("job_title"))
+        job["schedule_classification"] = classify_evening_eligibility(job)
+        return True, "Passed"
     
     def discover(self, greenhouse_boards=None, lever_boards=None):
         all_jobs = []
@@ -129,37 +117,119 @@ class DiscoveryAgent:
             'rejected_reasons': {},
             'errors': [],
             'sources': {},
-            'per_source': {}
         }
         gh_res = self.greenhouse.search(greenhouse_boards or [])
         all_jobs.extend(gh_res['jobs'])
-        stats['sources']['greenhouse'] = gh_res['statuses']
+        stats['sources']['greenhouse'] = [
+            {
+                "board": status["board"],
+                "status": status["status"],
+                "retrieved": status["retrieved"],
+                "error": status["error"],
+            }
+            for status in gh_res['statuses']
+        ]
         stats['retrieved'] += len(gh_res['jobs'])
-        stats['per_source']['greenhouse'] = {'retrieved': len(gh_res['jobs']), 'statuses': gh_res['statuses']}
         lev_res = self.lever.search(lever_boards or [])
         all_jobs.extend(lev_res['jobs'])
-        stats['sources']['lever'] = lev_res['statuses']
+        stats['sources']['lever'] = [
+            {
+                "board": status["board"],
+                "status": status["status"],
+                "retrieved": status["retrieved"],
+                "error": status["error"],
+            }
+            for status in lev_res['statuses']
+        ]
         stats['retrieved'] += len(lev_res['jobs'])
-        stats['per_source']['lever'] = {'retrieved': len(lev_res['jobs']), 'statuses': lev_res['statuses']}
-        all_jobs.extend(self.job_bank.search())
-        all_jobs.extend(self.employer.search())
+        remotive_res = self.remotive.search()
+        all_jobs.extend(remotive_res["jobs"])
+        stats["sources"]["remotive"] = {
+            "status": remotive_res["status"],
+            "retrieved": remotive_res["retrieved"],
+            "last_checked": remotive_res["last_checked"],
+            "error": remotive_res["error"],
+            "warnings": remotive_res.get("warnings", []),
+        }
+        stats["retrieved"] += len(remotive_res["jobs"])
+        if remotive_res["status"] == "error":
+            stats["errors"].append(
+                {"source": "remotive", "error": remotive_res["error"]}
+            )
+        stats["errors"].extend(
+            {"source": "remotive", "warning": warning}
+            for warning in remotive_res.get("warnings", [])
+        )
+
+        for status in gh_res["statuses"]:
+            if status["status"] == "ok":
+                feed_jobs = [
+                    job for job in gh_res["jobs"]
+                    if job.get("source_feed") == status["board"]
+                ]
+                self.tracker.update_source_snapshot(
+                    "greenhouse",
+                    status["board"],
+                    [job["job_url"] for job in feed_jobs],
+                    datetime.now().astimezone().isoformat(),
+                )
+            elif status["error"]:
+                stats["errors"].append(
+                    {"source": "greenhouse", "feed": status["board"], "error": status["error"]}
+                )
+        for status in lev_res["statuses"]:
+            if status["status"] == "ok":
+                feed_jobs = [
+                    job for job in lev_res["jobs"]
+                    if job.get("source_feed") == status["board"]
+                ]
+                self.tracker.update_source_snapshot(
+                    "lever",
+                    status["board"],
+                    [job["job_url"] for job in feed_jobs],
+                    datetime.now().astimezone().isoformat(),
+                )
+            elif status["error"]:
+                stats["errors"].append(
+                    {"source": "lever", "feed": status["board"], "error": status["error"]}
+                )
+        if remotive_res["status"] in {"ok", "cached"}:
+            self.tracker.update_source_snapshot(
+                "remotive",
+                "remotive",
+                [job["job_url"] for job in remotive_res["jobs"]],
+                remotive_res["last_checked"],
+                active_status="active_on_source_delayed",
+            )
+
         discovered = []
         for job in all_jobs:
+            job["job_category"] = job.get("job_category") or job_category(job.get("job_title"))
+            if self.tracker.job_exists(job.get("job_url", "")):
+                self.tracker.refresh_job_listing(job)
+                stats["duplicates_skipped"] += 1
+                stats["rejected_reasons"]["Previously known; source status refreshed"] = (
+                    stats["rejected_reasons"].get(
+                        "Previously known; source status refreshed", 0
+                    ) + 1
+                )
+                continue
             passed, reason = self.filter_job(job)
             if not passed:
-                if reason == "Duplicate":
-                    stats['duplicates_skipped'] += 1
-                elif reason == "Expired":
+                if reason == "Expired":
                     stats['expired_skipped'] += 1
                 stats['rejected_reasons'][reason] = stats['rejected_reasons'].get(reason, 0) + 1
                 continue
             job['discovered_at'] = datetime.now().isoformat()
+            job["last_verified_at"] = job.get("last_verified_at") or job.get("retrieved_at") or datetime.now().astimezone().isoformat()
+            job["listing_status"] = job.get("listing_status") or "active_on_source"
             job['status'] = 'discovered'
             job['approved'] = 0
             inserted = self.tracker.add_job(job)
             if not inserted:
                 stats['duplicates_skipped'] += 1
                 continue
+            job["id"] = inserted
             stats['new_saved'] += 1
             try:
                 from agents.matching_agent import MatchingAgent
@@ -169,5 +239,13 @@ class DiscoveryAgent:
             except Exception:
                 pass
             discovered.append(job)
+        stats["previously_known"] = stats["duplicates_skipped"]
+        stats["possible_repost_groups"] = len(
+            {
+                job["repost_group_key"]
+                for job in self.tracker.get_jobs()
+                if job.get("possible_repost_count", 1) > 1
+            }
+        )
         stats['last_updated'] = datetime.now().isoformat()
         return discovered, stats

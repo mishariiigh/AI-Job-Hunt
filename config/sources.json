@@ -1,4 +1,41 @@
 {
-  "greenhouse_boards": [],
-  "lever_boards": []
+  "greenhouse_boards": [
+    {
+      "token": "stripe",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 746,
+      "last_checked": "2026-11-03T16:58:05.335992"
+    },
+    {
+      "token": "gitlab",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 238,
+      "last_checked": "2026-11-03T16:58:03.747067"
+    },
+    {
+      "token": "geotab",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 59,
+      "last_checked": "2026-11-03T16:58:08.309893"
+    },
+    {
+      "token": "d2l",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 25,
+      "last_checked": "2026-11-04T13:04:45.308-05:00"
+    }
+  ],
+  "lever_boards": [
+    {
+      "token": "pointclickcare",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 79,
+      "last_checked": "2026-11-03T16:58:14.190168"
+    }
+  ]
 }

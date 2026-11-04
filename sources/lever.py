@@ -1,6 +1,7 @@
 import requests
 from typing import List, Dict
 from datetime import datetime
+from sources.date_utils import normalize_source_timestamp
 
 
 class LeverSource:
@@ -35,14 +36,17 @@ class LeverSource:
                 result['error'] = 'Unexpected response format'
                 return result
             
+            malformed_records = 0
             for j in data:
                 if not isinstance(j, dict):
+                    malformed_records += 1
                     continue
                 categories = j.get('categories') or {}
                 loc = categories.get('location') or j.get('workplaceType') or ''
                 desc = j.get('descriptionPlain') or j.get('description') or ''
                 job_url = j.get('hostedUrl') or j.get('applyUrl') or j.get('url') or ''
                 if not job_url:
+                    malformed_records += 1
                     continue
                 workplace = j.get('workplaceType') or ''
                 country = j.get('country') or ''
@@ -52,6 +56,7 @@ class LeverSource:
                     'job_title': j.get('text') or j.get('title') or '',
                     'job_url': job_url,
                     'source': 'lever',
+                    'source_feed': board.strip(),
                     'description': str(desc),
                     'location': loc if isinstance(loc, str) else str(loc),
                     'department': categories.get('team', '') if isinstance(categories, dict) else '',
@@ -61,13 +66,20 @@ class LeverSource:
                     'employment_type': categories.get('commitment', '') if isinstance(categories, dict) else '',
                     'experience_required': '',
                     'education_required': '',
-                    'posting_date': j.get('createdAt') or j.get('updatedAt'),
-                    'deadline': j.get('closingAt') or '',
+                    'posting_date': normalize_source_timestamp(j.get('createdAt')),
+                    'source_updated_at': normalize_source_timestamp(j.get('updatedAt')),
+                    'deadline': normalize_source_timestamp(j.get('closingAt')),
                     'workplace_type': workplace,
                     'country': country,
                     'retrieved_at': datetime.now().isoformat(),
-                    'last_checked': datetime.now().isoformat()
+                    'last_checked': datetime.now().isoformat(),
+                    'listing_status': 'active_on_source',
                 })
+            if malformed_records:
+                result['status'] = 'error'
+                result['error'] = (
+                    f'Source snapshot incomplete: skipped {malformed_records} malformed posting records'
+                )
             result['retrieved'] = len(result['jobs'])
             return result
         except requests.exceptions.Timeout:

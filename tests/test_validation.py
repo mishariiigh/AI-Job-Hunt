@@ -63,7 +63,15 @@ def test_hybrid_onsite():
 
 def test_schedule_classification():
     d = DiscoveryAgent()
-    assert d.classify_schedule({'description': 'Evening shift'})['confirmed_evening'] == True
+    evening_label_only = d.classify_schedule({'description': 'Evening shift'})
+    assert evening_label_only['confirmed_evening'] is False
+    assert evening_label_only['schedule_type'] == 'needs_verification'
+    assert d.classify_schedule(
+        {
+            'description': 'Shift starts at 5 PM',
+            'location': 'Oakville, Ontario',
+        }
+    )['confirmed_evening'] is True
     assert d.classify_schedule({'description': 'Weekend availability'})['confirmed_weekend'] == True
     assert d.classify_schedule({'description': 'Flexible schedule'})['flexible'] == True
     sched = d.classify_schedule({'description': 'IT support role'})
