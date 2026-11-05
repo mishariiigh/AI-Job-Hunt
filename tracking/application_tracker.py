@@ -523,8 +523,9 @@ class ApplicationTracker:
                  employment_type, experience_required, education_required, posting_date, deadline,
                  discovered_at, match_score, match_explanation, status, approved, job_category,
                  source_feed, source_updated_at, last_verified_at, listing_status,
-                 schedule_classification, repost_group_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 schedule_classification, repost_group_key,
+                 gh_job_id, gh_metadata, office_locations, enriched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data.get('employer'), job_data.get('job_title'), job_url_norm,
                 job_data.get('source'), job_data.get('description'), job_data.get('location'),
@@ -537,7 +538,11 @@ class ApplicationTracker:
                 job_data.get("source_updated_at"),
                 job_data.get("last_verified_at") or job_data.get("retrieved_at"),
                 job_data.get("listing_status", "unknown"),
-                schedule_classification, job_data.get("repost_group_key") or self.repost_group_key(job_data)
+                schedule_classification, job_data.get("repost_group_key") or self.repost_group_key(job_data),
+                job_data.get("gh_job_id") or "",
+                job_data.get("gh_metadata") or "",
+                job_data.get("office_locations") or "",
+                datetime.now().isoformat() if job_data.get("gh_job_id") else None,
             ))
             conn.commit()
             if cur.rowcount == 0:
@@ -577,15 +582,33 @@ class ApplicationTracker:
                 schedule_classification,
                 job_data.get("description"),
             )
-            schedule_classification = self._merge_manual_resolution(
-                stored_manual,
-                stored_description_hash,
-                stored_reverify_flag,
-                schedule_classification,
-                job_data.get("description"),
-            )
         conn = get_conn()
         try:
+            # Stage 12.3: enrich without damage — only overwrite an existing
+            # enriched field when the feed provides a non-empty value.
+            conn.execute(
+                """
+                UPDATE jobs
+                SET gh_job_id = CASE WHEN ? != '' THEN ? ELSE gh_job_id END,
+                    gh_metadata = CASE WHEN ? != '' THEN ? ELSE gh_metadata END,
+                    office_locations = CASE WHEN ? != '' THEN ? ELSE office_locations END,
+                    enriched_at = CASE
+                        WHEN ? != '' THEN ?
+                        ELSE enriched_at END
+                WHERE job_url = ?
+                """,
+                (
+                    job_data.get("gh_job_id") or "",
+                    job_data.get("gh_job_id") or "",
+                    job_data.get("gh_metadata") or "",
+                    job_data.get("gh_metadata") or "",
+                    job_data.get("office_locations") or "",
+                    job_data.get("office_locations") or "",
+                    job_data.get("gh_job_id") or "",
+                    datetime.now().isoformat(),
+                    job_url,
+                ),
+            )
             cursor = conn.execute(
                 """
                 UPDATE jobs

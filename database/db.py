@@ -21,6 +21,12 @@ def ensure_job_columns(conn):
         "listing_status": "TEXT NOT NULL DEFAULT 'unknown'",
         "schedule_classification": "TEXT NOT NULL DEFAULT '{}'",
         "repost_group_key": "TEXT NOT NULL DEFAULT ''",
+        # Stage 12.3: Greenhouse detail enrichment (additive, nullable/empty
+        # by default so existing rows are untouched).
+        "gh_job_id": "TEXT NOT NULL DEFAULT ''",
+        "gh_metadata": "TEXT NOT NULL DEFAULT ''",
+        "office_locations": "TEXT NOT NULL DEFAULT ''",
+        "enriched_at": "TEXT",
     }
     added = set()
     for name, declaration in migrations.items():
