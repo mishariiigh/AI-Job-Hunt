@@ -77,7 +77,9 @@ def test_unknown_schedule_with_95_technical_match_is_not_confirmed():
     )
     confirmed_result = classify_opportunity(confirmed_job)
     assert confirmed_result["status"] == "confirmed_evening"
-    assert opportunity_priority_key(confirmed_job, confirmed_result, profile_score=40) > key
+    assert opportunity_priority_key(
+        confirmed_job, confirmed_result, profile_score=40
+    ) > key
 
 
 def test_rotating_shift_with_daytime_possibilities_needs_verification():
@@ -93,14 +95,18 @@ def test_rotating_shift_with_daytime_possibilities_needs_verification():
 
 def test_on_call_does_not_establish_evening_schedule():
     result = classify_evening_eligibility(
-        _confirmed_evening_job(description="Provide on-call support for evening escalations.")
+        _confirmed_evening_job(
+            description="Provide on-call support for evening escalations."
+        )
     )
     assert result["status"] != "confirmed_evening"
 
 
 def test_flexible_hours_do_not_establish_evening_schedule():
     result = classify_evening_eligibility(
-        _confirmed_evening_job(description="Flexible hours; evening availability preferred.")
+        _confirmed_evening_job(
+            description="Flexible hours; evening availability preferred."
+        )
     )
     assert result["status"] != "confirmed_evening"
 
@@ -122,7 +128,10 @@ def test_conflicting_metadata_and_description_needs_verification():
 def test_remote_job_excluding_canadian_applicants_is_rejected():
     result = classify_opportunity(
         _confirmed_evening_job(
-            description="Shift: 5 PM - 1 AM. Remote candidates must reside in the United States.",
+            description=(
+                "Shift: 5 PM - 1 AM. Remote candidates must reside in "
+                "the United States."
+            ),
             location="Remote",
         )
     )
@@ -143,7 +152,9 @@ def test_mississauga_in_person_with_verified_gates_is_confirmed():
 
 def test_mandatory_french_is_rejected():
     result = classify_opportunity(
-        _confirmed_evening_job(description="Shift: 5 PM - 1 AM. Bilingual French required.")
+        _confirmed_evening_job(
+            description="Shift: 5 PM - 1 AM. Bilingual French required."
+        )
     )
     assert result["status"] == "rejected"
     assert any("French" in reason for reason in result["reasons"])
@@ -223,7 +234,11 @@ def test_pointclickcare_dbre_regression_stays_out_of_confirmed_evening():
     result = classify_opportunity(job)
     assert result["status"] == "needs_verification"
     assert result["evening"]["status"] != "confirmed_evening"
-    assert result["evening"].get("schedule_type") in {"unknown", "flexible", "needs_verification"}
+    assert result["evening"].get("schedule_type") in {
+        "unknown",
+        "flexible",
+        "needs_verification",
+    }
     # Technical score stays intact and separate
     assert float(job["match_score"]) == 64.29
 
@@ -243,7 +258,9 @@ def test_full_time_ranks_below_equivalent_part_time():
     assert part_result["match_score"] > full_result["match_score"]
     part_opp = classify_opportunity(part_time)
     full_opp = classify_opportunity(full_time)
-    assert opportunity_priority_key(part_time, part_opp) > opportunity_priority_key(full_time, full_opp)
+    assert opportunity_priority_key(part_time, part_opp) > opportunity_priority_key(
+        full_time, full_opp
+    )
 
 
 def test_genuine_mandatory_gap_is_confirmed_missing():
