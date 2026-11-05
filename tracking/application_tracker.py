@@ -2,9 +2,11 @@ import hashlib
 import json
 import re
 from collections import Counter
-from database.db import ensure_job_columns, get_conn, init_db
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
+
+from agents.job_classifier import classify_evening_eligibility
+from database.db import ensure_job_columns, get_conn, init_db
 
 
 class ApplicationTracker:
@@ -266,6 +268,28 @@ class ApplicationTracker:
         conn.close()
         return True
 
+    @staticmethod
+    def _persisted_schedule_classification(job_data):
+        """Return the authoritative schedule classification for persistence.
+
+        Uses the classifier result supplied by discovery when present;
+        otherwise computes it with the existing authoritative classifier.
+        A manually resolved classification (carrying manual_resolution with
+        source/evidence/timestamp) is preserved untouched.
+        """
+        existing = job_data.get("schedule_classification")
+        if isinstance(existing, dict) and existing.get("manual_resolution"):
+            return json.dumps(existing)
+        if isinstance(existing, str):
+            try:
+                parsed = json.loads(existing)
+            except (TypeError, ValueError):
+                parsed = {}
+            if isinstance(parsed, dict) and parsed.get("manual_resolution"):
+                return existing
+        result = classify_evening_eligibility(job_data)
+        return json.dumps(result)
+
     def add_job(self, job_data):
         if not self._valid_job(job_data):
             return None
@@ -277,13 +301,11 @@ class ApplicationTracker:
             return None
         try:
             now = datetime.now().astimezone().isoformat()
-            schedule_classification = job_data.get("schedule_classification") or {}
-            if not isinstance(schedule_classification, str):
-                schedule_classification = json.dumps(schedule_classification)
+            schedule_classification = self._persisted_schedule_classification(job_data)
             cur.execute("""
-                INSERT OR IGNORE INTO jobs 
-                (employer, job_title, job_url, source, description, location, remote, salary, shift, 
-                 employment_type, experience_required, education_required, posting_date, deadline, 
+                INSERT OR IGNORE INTO jobs
+                (employer, job_title, job_url, source, description, location, remote, salary, shift,
+                 employment_type, experience_required, education_required, posting_date, deadline,
                  discovered_at, match_score, match_explanation, status, approved, job_category,
                  source_feed, source_updated_at, last_verified_at, listing_status,
                  schedule_classification, repost_group_key)
@@ -317,9 +339,7 @@ class ApplicationTracker:
         if not job_url:
             return False
         verified_at = checked_at or job_data.get("last_verified_at") or datetime.now().astimezone().isoformat()
-        schedule_classification = job_data.get("schedule_classification") or {}
-        if not isinstance(schedule_classification, str):
-            schedule_classification = json.dumps(schedule_classification)
+        schedule_classification = self._persisted_schedule_classification(job_data)
         conn = get_conn()
         try:
             cursor = conn.execute(

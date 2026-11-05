@@ -55,7 +55,9 @@ class DiscoveryAgent:
             or str(job.get("workplace_type") or "").lower() in {"remote", "hybrid"}
             or "remote" in location
         )
-        local = bool(re.search(r"\b(?:oakville|mississauga)\b", location))
+        local = bool(
+            re.search(r"\b(?:oakville|mississauga|toronto)\b", location, re.I)
+        )
         return remote or local
 
     def classify_schedule(self, job):
@@ -205,6 +207,7 @@ class DiscoveryAgent:
         discovered = []
         for job in all_jobs:
             job["job_category"] = job.get("job_category") or job_category(job.get("job_title"))
+            job["schedule_classification"] = classify_evening_eligibility(job)
             if self.tracker.job_exists(job.get("job_url", "")):
                 self.tracker.refresh_job_listing(job)
                 stats["duplicates_skipped"] += 1

@@ -164,10 +164,10 @@ def test_discovery_keeps_uncertain_remote_jobs_for_analysis_but_rejects_bad_fit(
     }
     rejected_location = {
         "job_title": "Software Developer",
-        "location": "Toronto, Ontario",
+        "location": "Ottawa, Ontario",
         "remote": False,
         "description": "Software development.",
-        "job_url": "https://jobs.example.com/toronto",
+        "job_url": "https://jobs.example.com/ottawa",
     }
     rejected_language = {
         "job_title": "IT Support Specialist",
