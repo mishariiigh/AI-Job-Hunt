@@ -1,4 +1,5 @@
 
+import json
 import re
 from datetime import datetime, time
 from sources.date_utils import normalize_source_timestamp
@@ -730,16 +731,18 @@ def classify_evening_eligibility(job, schedule_resolution=None):
             result = {
                 **result,
                 "status": resolution["value"],
-                "schedule_type": (
-                    "confirmed_evening"
-                    if resolution["value"] == "confirmed_evening"
-                    else "day_shift"
-                ),
                 "conflict": False,
                 "manual_resolution": resolution,
                 "reason": "Schedule conflict manually resolved using the recorded source.",
                 "confidence": "user_verified",
             }
+            # The automatic schedule_type/start_time describe the posting as
+            # the source currently states it; the manual decision overrides
+            # status but not the observed source evidence.
+            if resolution["value"] == "confirmed_evening":
+                result.setdefault("schedule_type", "confirmed_evening")
+            else:
+                result["schedule_type"] = "day_shift"
     result["confirmed_evening"] = result["status"] == "confirmed_evening"
     result["needs_schedule_verification"] = (
         result["status"] in {"unknown", "needs_verification"}
@@ -748,6 +751,25 @@ def classify_evening_eligibility(job, schedule_resolution=None):
 
 
 def classify_opportunity(job, schedule_resolution=None):
+    if schedule_resolution is None:
+        # Honour a persisted manual schedule resolution (with source,
+        # evidence, and timestamp) stored on the job record.
+        stored = job.get("schedule_classification")
+        if isinstance(stored, str):
+            try:
+                stored = json.loads(stored)
+            except (TypeError, ValueError):
+                stored = None
+        if isinstance(stored, dict):
+            resolution = stored.get("manual_resolution")
+            if (
+                isinstance(resolution, dict)
+                and resolution.get("value") in {"confirmed_evening", "incompatible"}
+                and resolution.get("source")
+                and resolution.get("evidence")
+                and resolution.get("timestamp")
+            ):
+                schedule_resolution = resolution
     evening = classify_evening_eligibility(job, schedule_resolution)
     canada = canadian_eligibility(job)
     blockers = []

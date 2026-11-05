@@ -9,6 +9,10 @@ from agents.job_classifier import classify_evening_eligibility
 from database.db import ensure_job_columns, get_conn, init_db
 
 
+class ManualResolutionError(ValueError):
+    """Raised when a manual schedule resolution is incomplete or invalid."""
+
+
 class ApplicationTracker:
     def __init__(self):
         ensure_schema()
@@ -269,13 +273,210 @@ class ApplicationTracker:
         return True
 
     @staticmethod
+    def _description_fingerprint(description):
+        """Whitespace-insensitive description fingerprint for change detection."""
+        return " ".join(str(description or "").split())
+
+    def _stored_manual_resolution(self, job_url):
+        """Return the stored manual state for a job.
+
+        Returns (manual_resolution dict or None, description fingerprint
+        recorded at verification, current re-verification flag). The flag is
+        read from the stored classification so it survives repeated
+        automatic refreshes until an explicit user re-verification.
+        """
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT schedule_classification FROM jobs WHERE job_url = ?",
+                (job_url,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None, None, False
+        try:
+            parsed = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None, None, False
+        if not isinstance(parsed, dict):
+            return None, None, False
+        resolution = parsed.get("manual_resolution")
+        ok = isinstance(resolution, dict) and resolution.get("value")
+        stored_hash = parsed.get("description_fingerprint_at_resolution")
+        stored_flag = bool(parsed.get("manual_evidence_needs_reverification"))
+        return (resolution if ok else None), stored_hash, stored_flag
+
+    @staticmethod
+    def _merge_manual_resolution(
+        stored_manual, stored_description_hash, stored_reverify_flag,
+        schedule_classification, description,
+    ):
+        """Re-apply the stored manual resolution onto an automatic refresh.
+
+        The manual decision always wins over automatic classification. The
+        incoming description is compared against a fingerprint of the
+        description present when the manual resolution was originally
+        verified ("description_fingerprint_at_resolution" is only updated
+        by an explicit user re-verification, never by automatic refreshes):
+        an unchanged description keeps the resolution cleanly; a changed
+        description retains the decision but flags that the manual evidence
+        must be re-verified. Repeated refreshes never clear the flag on
+        their own. The automatic classification evidence is preserved
+        inside the merged result rather than discarded.
+        """
+        if isinstance(schedule_classification, str):
+            try:
+                automatic = json.loads(schedule_classification)
+            except (TypeError, ValueError):
+                automatic = {}
+        else:
+            automatic = schedule_classification or {}
+        description_changed = (
+            description is not None
+            and (
+                stored_description_hash is None
+                or ApplicationTracker._description_fingerprint(description)
+                != stored_description_hash
+            )
+        )
+        merged = {
+            **automatic,
+            "manual_resolution": stored_manual,
+            # Keep the ORIGINAL verification fingerprint: it anchors the
+            # evidence to the posting text the user actually verified.
+            # Automatic refreshes must not move this anchor, or a second
+            # refresh of a changed posting would silently clear the
+            # re-verification flag.
+            "description_fingerprint_at_resolution": stored_description_hash,
+        }
+        if stored_manual.get("value") == "confirmed_evening":
+            merged["status"] = "confirmed_evening"
+            merged["schedule_type"] = "confirmed_evening"
+            merged["confirmed_evening"] = True
+            merged["needs_schedule_verification"] = False
+        elif stored_manual.get("value") == "incompatible":
+            merged["status"] = "incompatible"
+            merged["schedule_type"] = "day_shift"
+            merged["confirmed_evening"] = False
+        if description_changed:
+            merged["manual_evidence_needs_reverification"] = True
+            merged["reason"] = (
+                "Manually verified schedule retained, but the source posting "
+                "description changed after the manual evidence was recorded; "
+                "re-verify the evidence against the current posting."
+            )
+        else:
+            # Only an explicit user re-verification (which replaces the
+            # manual_resolution and re-anchors the fingerprint) may clear
+            # this flag; automatic refreshes never do.
+            merged["manual_evidence_needs_reverification"] = bool(stored_reverify_flag)
+        return json.dumps(merged)
+
+    def record_manual_schedule_resolution(
+        self, job_id, resolution, verified_description=None,
+    ):
+        """Explicit user-confirmed schedule re-verification.
+
+        This is the ONLY operation that may replace a stored manual
+        resolution, re-anchor description_fingerprint_at_resolution, and
+        clear manual_evidence_needs_reverification. Discovery refreshes can
+        never reach this code path.
+
+        Required resolution fields: value (confirmed_evening or
+        incompatible), source, evidence, timestamp. Incomplete or invalid
+        resolutions are rejected with ManualResolutionError and change
+        nothing.
+
+        verified_description: the job description the user verified against.
+        Defaults to the description currently stored for the job; passing a
+        different description would break provenance, so it is validated.
+        """
+        from agents.job_classifier import classify_evening_eligibility
+
+        if not isinstance(resolution, dict):
+            raise ManualResolutionError("Resolution must be an object.")
+        if resolution.get("value") not in {"confirmed_evening", "incompatible"}:
+            raise ManualResolutionError(
+                "Resolution value must be 'confirmed_evening' or 'incompatible'."
+            )
+        for field in ("source", "evidence", "timestamp"):
+            if not str(resolution.get(field) or "").strip():
+                raise ManualResolutionError(
+                    f"Resolution field '{field}' is required."
+                )
+
+        conn = get_conn()
+        try:
+            # Atomic read-modify-write: BEGIN IMMEDIATE takes the database
+            # write lock up front, so a concurrent discovery refresh cannot
+            # change the description between the verification SELECT and
+            # the persistence UPDATE. Matches the existing pattern used by
+            # create_application_draft and the submission path.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT description, schedule_classification FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise ManualResolutionError(f"Job {job_id} does not exist.")
+            try:
+                classification = json.loads(row["schedule_classification"] or "{}")
+            except (TypeError, ValueError):
+                classification = {}
+            if not isinstance(classification, dict):
+                classification = {}
+            description = verified_description
+            if description is None:
+                description = row["description"]
+            elif description != row["description"]:
+                raise ManualResolutionError(
+                    "verified_description does not match the stored posting "
+                    "description; re-verification must reference the posting "
+                    "as currently recorded."
+                )
+            automatic = classify_evening_eligibility(
+                {**dict(row), "description": description}
+            )
+            merged = {
+                **classification,
+                **automatic,
+                "manual_resolution": dict(resolution),
+                "description_fingerprint_at_resolution": (
+                    self._description_fingerprint(description)
+                ),
+                "manual_evidence_needs_reverification": False,
+                "confidence": "user_verified",
+            }
+            if resolution["value"] == "confirmed_evening":
+                merged["status"] = "confirmed_evening"
+                merged["confirmed_evening"] = True
+                merged["needs_schedule_verification"] = False
+            else:
+                merged["status"] = "incompatible"
+                merged["confirmed_evening"] = False
+                merged["needs_schedule_verification"] = False
+            conn.execute(
+                "UPDATE jobs SET schedule_classification = ? WHERE id = ?",
+                (json.dumps(merged), job_id),
+            )
+            conn.commit()
+            return merged
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
     def _persisted_schedule_classification(job_data):
         """Return the authoritative schedule classification for persistence.
 
         Uses the classifier result supplied by discovery when present;
         otherwise computes it with the existing authoritative classifier.
-        A manually resolved classification (carrying manual_resolution with
-        source/evidence/timestamp) is preserved untouched.
+        A manually resolved classification supplied in the incoming payload
+        (carrying manual_resolution with source/evidence/timestamp) is
+        preserved untouched.
         """
         existing = job_data.get("schedule_classification")
         if isinstance(existing, dict) and existing.get("manual_resolution"):
@@ -302,6 +503,20 @@ class ApplicationTracker:
         try:
             now = datetime.now().astimezone().isoformat()
             schedule_classification = self._persisted_schedule_classification(job_data)
+            # Record the description fingerprint at insert so future manual
+            # resolutions and refreshes can detect posting-text changes.
+            try:
+                stored_classification = json.loads(schedule_classification)
+            except (TypeError, ValueError):
+                stored_classification = {}
+            if isinstance(stored_classification, dict) and (
+                stored_classification.get("manual_resolution")
+                and not stored_classification.get("description_fingerprint_at_resolution")
+            ):
+                stored_classification["description_fingerprint_at_resolution"] = (
+                    self._description_fingerprint(job_data.get("description"))
+                )
+                schedule_classification = json.dumps(stored_classification)
             cur.execute("""
                 INSERT OR IGNORE INTO jobs
                 (employer, job_title, job_url, source, description, location, remote, salary, shift,
@@ -340,6 +555,35 @@ class ApplicationTracker:
             return False
         verified_at = checked_at or job_data.get("last_verified_at") or datetime.now().astimezone().isoformat()
         schedule_classification = self._persisted_schedule_classification(job_data)
+        # Preserve a manually verified schedule resolution across automatic
+        # refreshes: the incoming feed payload never carries manual_resolution,
+        # so without this check the automatic classification would overwrite
+        # the stored decision. If the source description changed, flag that
+        # the manual evidence may need re-verification instead of silently
+        # discarding either version.
+        # Provenance rule: an automatic discovery refresh can NEVER create or
+        # re-verify manual evidence, no matter what fields the feed payload
+        # carries. Only record_manual_schedule_resolution() (a dedicated,
+        # explicit user-confirmed operation) may replace a resolution, re-anchor
+        # the description fingerprint, or clear the re-verification flag.
+        stored_manual, stored_description_hash, stored_reverify_flag = (
+            self._stored_manual_resolution(job_url)
+        )
+        if stored_manual:
+            schedule_classification = self._merge_manual_resolution(
+                stored_manual,
+                stored_description_hash,
+                stored_reverify_flag,
+                schedule_classification,
+                job_data.get("description"),
+            )
+            schedule_classification = self._merge_manual_resolution(
+                stored_manual,
+                stored_description_hash,
+                stored_reverify_flag,
+                schedule_classification,
+                job_data.get("description"),
+            )
         conn = get_conn()
         try:
             cursor = conn.execute(
