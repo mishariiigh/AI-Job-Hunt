@@ -865,9 +865,28 @@ def opportunity_status_label(opportunity):
 
 
 def opportunity_priority_key(job, opportunity=None, profile_score=None):
-    """Rank non-rejected jobs by location eligibility, schedule, and fit."""
+    """Rank jobs by structured suitability, not by numeric score alone.
+
+    Ordering (most significant first):
+    1. eligibility_gate_rank — disqualified jobs never rank as eligible.
+    2. canada_rank — confirmed Canadian eligibility ahead of unknown.
+    3. schedule_rank — confirmed evening/overnight ahead of flexible/unknown.
+    4. schedule_signal_rank — evening-mentioned postings ahead of silent ones
+       within the same schedule status.
+    5. arrangement_rank / part_time_rank — geographic and hours preferences.
+    6. score — the technical profile score is a supporting factor only.
+    7. freshness_rank — recency tiebreaker.
+    """
     opportunity = opportunity or classify_opportunity(job)
-    eligibility_gate_rank = int(opportunity.get("status") != "rejected")
+    # Seniority mismatch recorded by the matcher is a provenance-backed
+    # disqualifier (candidate has ~4 years; senior/staff/principal roles
+    # require more). It must remove the job from eligible ranking.
+    seniority_mismatch = "seniority mismatch" in _text(
+        job.get("hard_disqualifiers")
+    )
+    eligibility_gate_rank = int(
+        opportunity.get("status") != "rejected" and not seniority_mismatch
+    )
     canada_rank = {
         "confirmed_compatible": 3,
         "potentially_compatible": 2,
@@ -877,9 +896,7 @@ def opportunity_priority_key(job, opportunity=None, profile_score=None):
 
     evening = opportunity.get("evening", {})
     signals = evening.get("schedule_signals", {})
-    if evening.get("status") == "confirmed_evening":
-        schedule_rank = 3
-    elif evening.get("status") == "needs_verification" or any(
+    has_evening_signal = any(
         signals.get(key)
         for key in (
             "evening_shift",
@@ -888,12 +905,21 @@ def opportunity_priority_key(job, opportunity=None, profile_score=None):
             "after_hours_support",
             "multiple_shift_options",
         )
-    ) or evening.get("conflict"):
+    )
+    if evening.get("status") == "confirmed_evening":
+        schedule_rank = 3
+    elif evening.get("status") == "needs_verification" or (
+        has_evening_signal or evening.get("conflict")
+    ):
         schedule_rank = 2
     elif evening.get("status") == "incompatible":
         schedule_rank = 0
     else:
         schedule_rank = 1
+    # Distinguish "evening mentioned, hours unknown" from "flexible/unknown
+    # with no evening mention" so keyword-stuffed high scorers without any
+    # evening relevance do not outrank genuine evening possibilities.
+    schedule_signal_rank = 1 if has_evening_signal else 0
 
     if profile_score is None:
         try:
@@ -907,7 +933,7 @@ def opportunity_priority_key(job, opportunity=None, profile_score=None):
 
     location = _text(job.get("location"))
     remote = _is_remote(job) or "remote" in location
-    local = bool(re.search(r"\b(?:oakville|mississauga|toronto)\b", location))
+    local = bool(re.search(r"\b(?:oakville|mississauga|toronto)\b", location, re.I))
     arrangement_rank = 2 if remote else 1 if local else 0
     schedule_text = (
         f"{_text(job.get('employment_type'))} {_text(job.get('description'))}"
@@ -936,8 +962,9 @@ def opportunity_priority_key(job, opportunity=None, profile_score=None):
         eligibility_gate_rank,
         canada_rank,
         schedule_rank,
-        score,
+        schedule_signal_rank,
         arrangement_rank,
         part_time_rank,
+        score,
         freshness_rank,
     )

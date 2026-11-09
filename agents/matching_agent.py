@@ -60,6 +60,9 @@ class MatchingAgent:
         text = f"{title} {desc}".lower()
         location = (job.get('location') or '').lower()
         # Mandatory French is a hard disqualifier (gate, not score)
+        senior_terms = ['senior', 'staff', 'principal', 'lead architect', 'engineering manager']
+        if any(t in title.lower() for t in senior_terms):
+            hard_disqualifiers.append('Seniority mismatch')
         if 'french required' in text or 'français requis' in text or 'bilingual french required' in text or 'mandatory french' in text:
             hard_disqualifiers.append('Mandatory French requirement')
 
@@ -686,6 +689,10 @@ class MatchingAgent:
             item["requirement"] for item in mandatory
             if item["evidence_status"] == "Confirmed missing"
         ]
+        title = (job.get('job_title') or '').lower()
+        senior_terms = ['senior', 'staff', 'principal', 'lead architect', 'engineering manager']
+        if any(t in title for t in senior_terms):
+            mandatory_gaps.append('Seniority mismatch')
         requirements_requiring_review = [
             item["requirement"] for item in mandatory
             if item["evidence_status"] in {"Not evidenced", "Requires user verification"}
@@ -704,6 +711,8 @@ class MatchingAgent:
             reason = "evening eligibility needs verification"
         elif cj["canadian_eligibility"]["status"] != "confirmed_compatible":
             reason = "Canadian eligibility not confirmed"
+        elif 'Seniority mismatch' in mandatory_gaps:
+            reason = "seniority mismatch"
         elif cj["expiry_status"]["status"] != "confirmed_compatible":
             reason = "job posting is expired"
         elif cj["french_requirement"]["status"] == "incompatible":

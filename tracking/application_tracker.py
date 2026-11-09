@@ -13,6 +13,25 @@ class ManualResolutionError(ValueError):
     """Raised when a manual schedule resolution is incomplete or invalid."""
 
 
+class FieldVerificationError(ValueError):
+    """Raised when a manual field verification is incomplete or invalid."""
+
+
+# Stage 12.6.3: allowed values for manually verified employment hours and
+# work arrangement. "unknown" is a valid explicit value: recording "I checked
+# and it is not stated" is itself verified information.
+EMPLOYMENT_HOURS_VALUES = {"full_time", "part_time", "exact_hours", "unknown"}
+WORK_ARRANGEMENT_VALUES = {
+    "remote_canada",
+    "remote_north_america",
+    "remote_worldwide",
+    "remote_location_restricted",
+    "hybrid",
+    "on_site",
+    "unknown",
+}
+
+
 class ApplicationTracker:
     def __init__(self):
         ensure_schema()
@@ -88,6 +107,116 @@ class ApplicationTracker:
         row = cur.fetchone()
         conn.close()
         return dict(row) if row else None
+
+    # ---- Discovery-stage pipeline (Interested → Verification Required →
+    # ---- Verified → Resume Ready). Deliberately separate from the
+    # ---- application lifecycle (Draft → Approved → …) which lives in
+    # ---- applications.status.
+
+    DISCOVERY_STATUSES = {
+        "discovered": 0,           # legacy: unchanged discovered postings
+        "interested": 1,
+        "verification_required": 2,
+        "verified": 3,
+        "resume_ready": 4,
+    }
+
+    DISCOVERY_TRANSITIONS = {
+        "discovered": {"interested", "verification_required"},
+        "interested": {"verification_required", "discovered"},
+        "verification_required": {"verified", "interested", "discovered"},
+        "verified": {"resume_ready", "verification_required", "interested", "discovered"},
+        "resume_ready": {"verified", "discovered"},
+    }
+
+    def get_discovery_status(self, job_id):
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return row[0] if row[0] in self.DISCOVERY_STATUSES else "discovered"
+
+    def set_discovery_status(self, job_id, new_status, *, resume_id=None):
+        """Move a job through the discovery pipeline.
+
+        User-controlled only: no automatic transitions. 'verified' requires a
+        manual schedule resolution with recorded evidence (provenance stays in
+        schedule_classification). 'resume_ready' requires a generated resume
+        (resume_id must reference an existing resume row).
+        """
+        if new_status not in self.DISCOVERY_STATUSES:
+            raise ValueError(f"Unknown discovery status: {new_status}")
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, schedule_classification FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                raise ValueError(f"Job {job_id} does not exist.")
+            current = row[0] if row[0] in self.DISCOVERY_STATUSES else "discovered"
+            if new_status == current:
+                conn.rollback()
+                return current
+            allowed = self.DISCOVERY_TRANSITIONS[current]
+            if new_status not in allowed:
+                conn.rollback()
+                raise ValueError(
+                    f"Invalid discovery transition: {current} → {new_status}. "
+                    f"Allowed: {sorted(allowed)}"
+                )
+            if new_status == "resume_ready":
+                if not resume_id:
+                    conn.rollback()
+                    raise ValueError(
+                        "resume_ready requires a generated resume for this job."
+                    )
+                # Resume versions live on application records: an application
+                # draft must exist for this job with a tailored resume.
+                resume_row = conn.execute(
+                    "SELECT id FROM applications WHERE job_id = ? AND"
+                    " (tailored_resume IS NOT NULL AND tailored_resume != '')",
+                    (job_id,),
+                ).fetchone()
+                if not resume_row:
+                    conn.rollback()
+                    raise ValueError(
+                        f"No application with a generated resume exists for job "
+                        f"{job_id}; resume_ready requires a generated, "
+                        "validated resume."
+                    )
+            if new_status == "verified":
+                try:
+                    classification = json.loads(row[1] or "{}")
+                except (TypeError, ValueError):
+                    classification = {}
+                has_resolution = bool(
+                    isinstance(classification, dict)
+                    and classification.get("manual_resolution")
+                )
+                if not has_resolution:
+                    conn.rollback()
+                    raise ValueError(
+                        "verified requires a manual schedule resolution with "
+                        "recorded evidence (source, evidence, timestamp)."
+                    )
+            conn.execute(
+                "UPDATE jobs SET status = ? WHERE id = ?", (new_status, job_id)
+            )
+            conn.commit()
+            return new_status
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_job(self, job_id):
         conn = get_conn()
@@ -468,6 +597,148 @@ class ApplicationTracker:
         finally:
             conn.close()
 
+    def record_manual_field_verification(
+        self, job_id, field_name, value, evidence, source,
+        timestamp=None, verified_description=None,
+    ):
+        """Stage 12.6.3: explicit user-verified employment details.
+
+        Stores user-verified employment hours or work arrangement with full
+        provenance in jobs.field_verification (JSON keyed by field name).
+        This is the ONLY operation that writes that column; discovery
+        refreshes never touch it.
+
+        Architecture notes (mirrors record_manual_schedule_resolution):
+        - One BEGIN IMMEDIATE transaction; any failure rolls the whole
+          operation back, including a concurrent refresh's write.
+        - Verified values are stored with field name, value, evidence text,
+          evidence source, and timestamp per field, so updating one field
+          never erases another field's evidence.
+        - The schedule verification system (schedule_classification /
+          manual_resolution) is untouched by this method; callers must use
+          record_manual_schedule_resolution for schedule verification.
+
+        field_name: "employment_hours" or "work_arrangement".
+        value: one of EMPLOYMENT_HOURS_VALUES / WORK_ARRANGEMENT_VALUES
+        (per field). "unknown" means the user verified the value is not
+        stated anywhere; it never becomes a positive confirmation.
+        evidence: the user's supporting text (required).
+        source: where the evidence came from, e.g. employer email (required).
+        verified_description: optional posting text the user verified
+        against; must match the stored description when supplied, for the
+        same provenance reason as in record_manual_schedule_resolution.
+        """
+        from agents.job_classifier import classify_evening_eligibility
+
+        if field_name not in {"employment_hours", "work_arrangement"}:
+            raise FieldVerificationError(
+                "field_name must be 'employment_hours' or 'work_arrangement'."
+            )
+        allowed = (
+            EMPLOYMENT_HOURS_VALUES
+            if field_name == "employment_hours"
+            else WORK_ARRANGEMENT_VALUES
+        )
+        if value not in allowed:
+            raise FieldVerificationError(
+                f"Invalid {field_name} value '{value}'. Allowed: {sorted(allowed)}"
+            )
+        evidence = str(evidence or "").strip()
+        source = str(source or "").strip()
+        if not evidence or not source:
+            raise FieldVerificationError(
+                "Both evidence text and evidence source are required."
+            )
+        timestamp = timestamp or datetime.now().astimezone().isoformat()
+        try:
+            datetime.fromisoformat(timestamp)
+        except ValueError:
+            raise FieldVerificationError("timestamp must be an ISO 8601 datetime.")
+        if field_name == "employment_hours" and value == "exact_hours":
+            # exact_hours needs the actual number in the evidence text.
+            if not re.search(r"\d", evidence):
+                raise FieldVerificationError(
+                    "exact_hours requires the number of weekly hours in the "
+                    "evidence text."
+                )
+
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT description, schedule_classification, "
+                "field_verification FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise FieldVerificationError(f"Job {job_id} does not exist.")
+            if verified_description is not None and verified_description != row["description"]:
+                raise FieldVerificationError(
+                    "verified_description does not match the stored posting "
+                    "description; verification must reference the posting as "
+                    "currently recorded."
+                )
+            try:
+                stored = json.loads(row["field_verification"] or "{}")
+            except (TypeError, ValueError):
+                stored = {}
+            if not isinstance(stored, dict):
+                stored = {}
+            stored[field_name] = {
+                "value": value,
+                "evidence": evidence,
+                "source": source,
+                "timestamp": timestamp,
+            }
+            conn.execute(
+                "UPDATE jobs SET field_verification = ? WHERE id = ?",
+                (json.dumps(stored), job_id),
+            )
+            conn.commit()
+            return stored
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def clear_manual_field_verification(self, job_id, field_name):
+        """Remove a manual field verification (correction path).
+
+        Only clears the named field; all other verified fields and the
+        schedule verification are untouched.
+        """
+        if field_name not in {"employment_hours", "work_arrangement"}:
+            raise FieldVerificationError(
+                "field_name must be 'employment_hours' or 'work_arrangement'."
+            )
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT field_verification FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                raise FieldVerificationError(f"Job {job_id} does not exist.")
+            try:
+                stored = json.loads(row["field_verification"] or "{}")
+            except (TypeError, ValueError):
+                stored = {}
+            if not isinstance(stored, dict):
+                stored = {}
+            stored.pop(field_name, None)
+            conn.execute(
+                "UPDATE jobs SET field_verification = ? WHERE id = ?",
+                (json.dumps(stored), job_id),
+            )
+            conn.commit()
+            return stored
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     @staticmethod
     def _persisted_schedule_classification(job_data):
         """Return the authoritative schedule classification for persistence.
@@ -524,8 +795,10 @@ class ApplicationTracker:
                  discovered_at, match_score, match_explanation, status, approved, job_category,
                  source_feed, source_updated_at, last_verified_at, listing_status,
                  schedule_classification, repost_group_key,
-                 gh_job_id, gh_metadata, office_locations, enriched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 gh_job_id, gh_metadata, office_locations, enriched_at,
+                 source_platform, original_source_url, employer_application_url,
+                 external_job_id, source_verification_status, imported_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data.get('employer'), job_data.get('job_title'), job_url_norm,
                 job_data.get('source'), job_data.get('description'), job_data.get('location'),
@@ -543,6 +816,16 @@ class ApplicationTracker:
                 job_data.get("gh_metadata") or "",
                 job_data.get("office_locations") or "",
                 datetime.now().isoformat() if job_data.get("gh_job_id") else None,
+                job_data.get("source_platform") or "",
+                job_data.get("original_source_url") or "",
+                job_data.get("employer_application_url") or "",
+                job_data.get("external_job_id") or "",
+                job_data.get("source_verification_status") or "",
+                (
+                    datetime.now().astimezone().isoformat()
+                    if job_data.get("source_platform")
+                    else None
+                ),
             ))
             conn.commit()
             if cur.rowcount == 0:
@@ -691,6 +974,24 @@ class ApplicationTracker:
         )
         for job in rows:
             job["possible_repost_count"] = group_counts.get(job["repost_group_key"], 1)
+        # Attach persisted hard disqualifiers (e.g. Seniority mismatch) so the
+        # ranking and UI can treat them as provenance-backed gates.
+        conn2 = get_conn()
+        try:
+            disqualifier_rows = {
+                r["job_id"]: r["hard_disqualifiers"]
+                for r in conn2.execute(
+                    "SELECT job_id, hard_disqualifiers FROM matches"
+                    " WHERE hard_disqualifiers IS NOT NULL"
+                    " AND hard_disqualifiers != '[]'"
+                ).fetchall()
+            }
+        finally:
+            conn2.close()
+        for job in rows:
+            disqualifiers = disqualifier_rows.get(job["id"])
+            if disqualifiers:
+                job["hard_disqualifiers"] = disqualifiers
         return rows
     
     def job_exists(self, job_url):

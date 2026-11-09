@@ -4,6 +4,7 @@ from sources.lever import LeverSource
 from sources.job_bank import JobBankSource
 from sources.employer_sites import EmployerSitesSource
 from sources.remotive import RemotiveSource
+from sources.smartrecruiters import SmartRecruitersSource
 from tracking.application_tracker import ApplicationTracker
 from datetime import datetime
 from agents.job_classifier import (
@@ -43,6 +44,8 @@ class DiscoveryAgent:
         self.job_bank = JobBankSource()
         self.employer = EmployerSitesSource()
         self.remotive = RemotiveSource()
+        self.smartrecruiters = SmartRecruitersSource()
+        self.smartrecruiters_companies = self._load_smartrecruiters_companies()
         self.tracker = ApplicationTracker()
     
     def is_canadian_remote(self, job):
@@ -59,6 +62,20 @@ class DiscoveryAgent:
             re.search(r"\b(?:oakville|mississauga|toronto)\b", location, re.I)
         )
         return remote or local
+
+    @staticmethod
+    def _load_smartrecruiters_companies():
+        """Load SmartRecruiters company IDs from config; empty list when unset."""
+        import json as _json
+        import os
+        config_path = os.path.join(os.path.dirname(__file__), "..", "config", "sources.json")
+        try:
+            with open(config_path) as fh:
+                config = _json.load(fh)
+            companies = config.get("smartrecruiters_companies") or []
+            return [str(c).strip() for c in companies if str(c).strip()]
+        except (OSError, ValueError):
+            return []
 
     def classify_schedule(self, job):
         classified = classify_evening_eligibility(job)
@@ -154,6 +171,18 @@ class DiscoveryAgent:
             "warnings": remotive_res.get("warnings", []),
         }
         stats["retrieved"] += len(remotive_res["jobs"])
+        sr_res = self.smartrecruiters.search(self.smartrecruiters_companies or [])
+        all_jobs.extend(sr_res["jobs"])
+        stats["sources"]["smartrecruiters"] = [
+            {
+                "board": status["company"],
+                "status": status["status"],
+                "retrieved": status["count"],
+                "error": status["error"],
+            }
+            for status in sr_res["statuses"]
+        ]
+        stats["retrieved"] += len(sr_res["jobs"])
         if remotive_res["status"] == "error":
             stats["errors"].append(
                 {"source": "remotive", "error": remotive_res["error"]}

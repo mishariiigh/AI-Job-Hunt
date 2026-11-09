@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import json
 from database.db import get_conn
-from tracking.application_tracker import ApplicationTracker
+from tracking.application_tracker import (
+    ApplicationTracker,
+    FieldVerificationError,
+)
 from agents.discovery_agent import DiscoveryAgent
 from agents.matching_agent import MatchingAgent
 from config.source_config import load_sources, save_sources
@@ -291,16 +294,26 @@ elif page == "Recommended Jobs":
         classified_jobs = [(job, classify_opportunity(job)) for job in jobs]
 
         def recommendation_category(job, result):
-            """Map opportunity status to one of the three display categories."""
+            """Map opportunity status to the four display categories."""
             if result["status"] == "confirmed_evening":
-                return "Confirmed Evening"
+                return "Confirmed Matches"
             if result["status"] == "rejected":
-                return "Not Suitable"
-            return "Needs Verification"
+                return "Disqualified"
+            evening_status = result.get("evening", {}).get("status")
+            if evening_status == "incompatible":
+                # Eligible on gates except schedule: verified daytime or
+                # otherwise incompatible hours.
+                return "Other Suitable Opportunities"
+            return "Potential Matches"
 
-        category_order = ["Confirmed Evening", "Needs Verification", "Not Suitable"]
+        category_order = [
+            "Confirmed Matches",
+            "Potential Matches",
+            "Other Suitable Opportunities",
+            "Disqualified",
+        ]
         counts = Counter(recommendation_category(job, result) for job, result in classified_jobs)
-        cols = st.columns(3)
+        cols = st.columns(4)
         for column, label in zip(cols, category_order):
             column.metric(label, counts[label])
 
@@ -357,12 +370,14 @@ elif page == "Recommended Jobs":
         for category in category_order:
             category_jobs = [item for item in filtered_jobs if item[3] == category]
             st.subheader(f"{category} ({len(category_jobs)})")
-            if category == "Confirmed Evening":
+            if category == "Confirmed Matches":
                 st.caption("All hard gates verified: qualifying evening shift, Canadian eligibility, acceptable location, no disqualifiers.")
-            elif category == "Needs Verification":
-                st.caption("Potentially suitable, but the schedule, eligibility, or another key detail is unverified. These are NOT confirmed evening opportunities.")
+            elif category == "Potential Matches":
+                st.caption("Relevant opportunities with unknown schedule or geographic details requiring verification. NOT confirmed evening opportunities.")
+            elif category == "Other Suitable Opportunities":
+                st.caption("Eligible on all gates except schedule — verified daytime or otherwise incompatible hours. Suitable if your availability differs.")
             else:
-                st.caption("Verified incompatible with your requirements. Shown here and in filters for audit purposes.")
+                st.caption("Disqualified by one or more hard gates (location, eligibility, language, closed posting). Hidden from ranking; shown for audit with reasons.")
             if not category_jobs:
                 st.info("No jobs currently in this category.")
                 continue
@@ -448,6 +463,197 @@ elif page == "Recommended Jobs":
                     ]
                     if match_skills:
                         st.write(f"**Main matching skills:** {match_skills[0]}")
+                    # Discovery-stage pipeline status (separate from application lifecycle)
+                    discovery_labels = {
+                        "discovered": "Not tracked",
+                        "interested": "Interested",
+                        "verification_required": "Verification Required",
+                        "verified": "Verified",
+                        "resume_ready": "Resume Ready",
+                    }
+                    current_discovery = job.get("status") or "discovered"
+                    allowed = tracker.DISCOVERY_TRANSITIONS.get(
+                        current_discovery, set()
+                    )
+                    st.write(
+                        f"**Pipeline status:** {discovery_labels.get(current_discovery, current_discovery)}"
+                    )
+                    next_options = sorted(allowed)
+                    if next_options:
+                        chosen = st.selectbox(
+                            "Move pipeline status",
+                            ["(no change)"] + [
+                                discovery_labels.get(s, s) for s in next_options
+                            ],
+                            key=f"discovery_status_{job['id']}",
+                        )
+                        if st.button(
+                            "Update pipeline status", key=f"discovery_btn_{job['id']}"
+                        ):
+                            target = next(
+                                (
+                                    s
+                                    for s in next_options
+                                    if discovery_labels.get(s, s) == chosen
+                                ),
+                                None,
+                            )
+                            if target:
+                                try:
+                                    tracker.set_discovery_status(
+                                        job["id"], target
+                                    )
+                                    st.success(
+                                        f"Pipeline status set to "
+                                        f"{discovery_labels.get(target, target)}."
+                                    )
+                                    st.rerun()
+                                except ValueError as error:
+                                    st.error(str(error))
+                    if current_discovery == "verification_required":
+                        st.caption(
+                            "Use the employer-verified schedule resolution in "
+                            "Application Review to record evidence before marking Verified."
+                        )
+                    # Stage 12.6.3: manually verified employment hours and work
+                    # arrangement. Optional fields — schedule verification
+                    # (Application Review) is separate and unchanged. Each
+                    # verified field stores value + evidence + source +
+                    # timestamp; updating one never erases another.
+                    try:
+                        stored_verification = json.loads(job.get("field_verification") or "{}")
+                    except (TypeError, ValueError):
+                        stored_verification = {}
+                    if not isinstance(stored_verification, dict):
+                        stored_verification = {}
+                    hours_values = {
+                        "(not verified)": "",
+                        "Full-time": "full_time",
+                        "Part-time": "part_time",
+                        "Exact weekly hours": "exact_hours",
+                        "Unknown — not stated in the posting": "unknown",
+                    }
+                    arrangement_values = {
+                        "(not verified)": "",
+                        "Remote — within Canada": "remote_canada",
+                        "Remote — within North America": "remote_north_america",
+                        "Remote — worldwide": "remote_worldwide",
+                        "Remote — specific location only": "remote_location_restricted",
+                        "Hybrid": "hybrid",
+                        "On-site": "on_site",
+                        "Unknown — not stated in the posting": "unknown",
+                    }
+                    hours_labels = {v: k for k, v in hours_values.items()}
+                    arrangement_labels = {v: k for k, v in arrangement_values.items()}
+                    hours_record = stored_verification.get("employment_hours") or {}
+                    arrangement_record = stored_verification.get("work_arrangement") or {}
+                    with st.expander("Verify hours & arrangement (optional manual evidence)", expanded=False):
+                        st.caption(
+                            "Record what you personally verified from the employer's own "
+                            "posting or communication. These fields are optional and never "
+                            "affect the match score, gates, or recommendation category. "
+                            "Schedule (shift-time) verification stays in Application Review."
+                        )
+                        if hours_record:
+                            st.write(
+                                f"**Verified hours:** {hours_labels.get(hours_record.get('value'), hours_record.get('value'))} — "
+                                f"source: {hours_record.get('source')} · "
+                                f"recorded: {hours_record.get('timestamp')}"
+                            )
+                            st.caption(f"Evidence: {hours_record.get('evidence')}")
+                        if arrangement_record:
+                            st.write(
+                                f"**Verified arrangement:** {arrangement_labels.get(arrangement_record.get('value'), arrangement_record.get('value'))} — "
+                                f"source: {arrangement_record.get('source')} · "
+                                f"recorded: {arrangement_record.get('timestamp')}"
+                            )
+                            st.caption(f"Evidence: {arrangement_record.get('evidence')}")
+                        st.markdown("**Original posting text:**")
+                        st.caption(
+                            f"Employment type as posted: {job.get('employment_type') or 'Not stated'} · "
+                            f"Location as posted: {job.get('location') or 'Not stated'}"
+                        )
+                        new_hours_label = st.selectbox(
+                            "Employment hours (verified)",
+                            list(hours_values),
+                            index=list(hours_values.values()).index(
+                                hours_record.get("value", "")
+                            ) if hours_record.get("value") in hours_values.values() else 0,
+                            key=f"verify_hours_{job['id']}",
+                        )
+                        # Map the display label to the canonical stored value
+                        new_hours = hours_values[new_hours_label]
+                        new_hours_evidence = st.text_area(
+                            "Hours evidence",
+                            value=str(hours_record.get("evidence") or ""),
+                            key=f"verify_hours_evidence_{job['id']}",
+                        )
+                        new_arrangement_label = st.selectbox(
+                            "Work arrangement (verified)",
+                            list(arrangement_values),
+                            index=list(arrangement_values.values()).index(
+                                arrangement_record.get("value", "")
+                            ) if arrangement_record.get("value") in arrangement_values.values() else 0,
+                            key=f"verify_arrangement_{job['id']}",
+                        )
+                        # Map the display label to the canonical stored value
+                        new_arrangement = arrangement_values[new_arrangement_label]
+                        new_arrangement_evidence = st.text_area(
+                            "Arrangement evidence",
+                            value=str(arrangement_record.get("evidence") or ""),
+                            key=f"verify_arrangement_evidence_{job['id']}",
+                        )
+                        new_source = st.text_input(
+                            "Evidence source (both fields)",
+                            value=str(
+                                (hours_record or arrangement_record).get("source") or ""
+                            ),
+                            help="For example: employer posting URL, employer email, phone confirmation.",
+                            key=f"verify_source_{job['id']}",
+                        )
+                        v_col1, v_col2, v_col3 = st.columns(3)
+                        if v_col1.button("Save hours verification", key=f"save_hours_{job['id']}"):
+                            try:
+                                if not new_hours:
+                                    st.warning("Choose a verified value first.")
+                                else:
+                                    tracker.record_manual_field_verification(
+                                        job["id"], "employment_hours", new_hours,
+                                        evidence=new_hours_evidence, source=new_source,
+                                    )
+                                    st.success("Employment hours verification recorded.")
+                                    st.rerun()
+                            except (FieldVerificationError, ValueError) as e:
+                                st.error(str(e))
+                        if v_col2.button("Save arrangement verification", key=f"save_arrangement_{job['id']}"):
+                            try:
+                                if not new_arrangement:
+                                    st.warning("Choose a verified value first.")
+                                else:
+                                    tracker.record_manual_field_verification(
+                                        job["id"], "work_arrangement", new_arrangement,
+                                        evidence=new_arrangement_evidence, source=new_source,
+                                    )
+                                    st.success("Work arrangement verification recorded.")
+                                    st.rerun()
+                            except (FieldVerificationError, ValueError) as e:
+                                st.error(str(e))
+                        if (hours_record or arrangement_record) and v_col3.button(
+                            "Clear a verification", key=f"clear_verification_{job['id']}"
+                        ):
+                            cleared_any = False
+                            try:
+                                if hours_record:
+                                    tracker.clear_manual_field_verification(job["id"], "employment_hours")
+                                    cleared_any = True
+                                if arrangement_record:
+                                    tracker.clear_manual_field_verification(job["id"], "work_arrangement")
+                                    cleared_any = True
+                            except (FieldVerificationError, ValueError) as e:
+                                st.error(str(e))
+                            if cleared_any:
+                                st.success("Verification cleared.")
+                                st.rerun()
                     status_label = opportunity_status_label(result)
                     if status_label == "Confirmed Evening":
                         st.success(
@@ -1018,12 +1224,25 @@ elif page == "My Applications":
     st.title("My Applications")
     applications = tracker.get_applications()
     if applications:
+        job_statuses = {
+            job["id"]: job.get("status") or "discovered" for job in tracker.get_jobs()
+        }
+        discovery_labels = {
+            "discovered": "Not tracked",
+            "interested": "Interested",
+            "verification_required": "Verification Required",
+            "verified": "Verified",
+            "resume_ready": "Resume Ready",
+        }
         rows = [
             {
                 "Employer": item.get("employer") or "",
                 "Job title": item.get("job_title") or "",
                 "Application date": item.get("submitted_at") or item.get("applied_at") or "",
-                "Status": item.get("status") or "Draft",
+                "Application status": item.get("status") or "Draft",
+                "Job pipeline status": discovery_labels.get(
+                    job_statuses.get(item.get("job_id"), "discovered"), "Not tracked"
+                ),
                 "Resume version": item.get("resume_version") or "",
                 "Cover letter version": item.get("version_number") or 1,
                 "Submission method": item.get("submission_method") or "Not submitted",
@@ -1313,61 +1532,187 @@ elif page == "Help":
     _help = True
 elif page == "Manual Job Intake":
     st.title("Manual Job Intake")
-    title = st.text_input("Job title (required)")
-    employer = st.text_input("Employer (required)")
-    url = st.text_input("Official job posting URL (required)")
-    desc = st.text_area("Full job description (required)")
-    location = st.text_input("Location")
-    emp_type = st.text_input("Employment type")
-    shift_hours = st.text_input("Shift hours (optional)")
-    education = st.text_input("Required education (optional)")
-    if st.button("Add Job", key="add_manual_job"):
-        if not title or not employer or not url or not desc or len(desc) < 20:
-            st.error("Missing required fields or description too short")
-        else:
-            from tracking.application_tracker import ApplicationTracker
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            if parsed.scheme not in ("http","https") or not parsed.netloc:
-                st.error("Invalid URL")
-            else:
-                tracker = ApplicationTracker()
-                job = {
-                    "employer": employer,
-                    "job_title": title,
-                    "job_url": url,
-                    "source": "manual",
-                    "description": desc,
-                    "location": location,
-                    "remote": "remote" in location.lower(),
-                    "employment_type": emp_type,
-                    "shift": shift_hours,
-                    "education_required": education,
-                    "schedule_classification": {"schedule_type": "unknown"},
+    st.caption(
+        "Paste a job posting from any platform. There is no automatic extraction "
+        "from Indeed or LinkedIn pages — enter the posting details yourself; "
+        "everything you enter is recorded as user-supplied and the app never "
+        "scrapes those platforms. Imported jobs go through the same eligibility "
+        "gates as discovered postings."
+    )
+    from sources.manual_intake import build_import_job, validate_import, ManualImportError
+
+    # Two-stage flow: stage 1 collects + previews (no DB writes), stage 2
+    # confirms and saves. Session state holds the draft between stages and
+    # is cleared after a successful save to prevent duplicate saves.
+    if not st.session_state.get("manual_import_preview"):
+        platform = st.selectbox(
+            "Platform",
+            ["Other / manual", "Indeed", "LinkedIn"],
+            key="manual_platform",
+        )
+        title = st.text_input("Job title (required)", key="mi_title")
+        employer = st.text_input("Employer (required)", key="mi_employer")
+        url = st.text_input("Official job posting URL (required)", key="mi_url")
+        desc = st.text_area("Full job description (required)", key="mi_desc")
+        location = st.text_input("Location", key="mi_location")
+        emp_type = st.text_input("Employment type", key="mi_emp_type")
+        shift_hours = st.text_input("Shift hours (optional)", key="mi_shift")
+        education = st.text_input("Required education (optional)", key="mi_edu")
+        employer_apply_url = st.text_input(
+            "Employer application URL (optional — where you would actually apply)",
+            key="mi_apply",
+        )
+        if st.button("Preview import", key="preview_manual_job"):
+            try:
+                platform_value = {
+                    "Other / manual": None,
+                    "Indeed": "indeed",
+                    "LinkedIn": "linkedin",
+                }[platform]
+                # Validate + normalize WITHOUT touching the database.
+                draft = build_import_job(
+                    url=url,
+                    title=title,
+                    employer=employer,
+                    description=desc,
+                    location=location,
+                    employment_type=emp_type,
+                    shift_hours=shift_hours,
+                    education_required=education,
+                    employer_application_url=employer_apply_url or None,
+                    platform=platform_value,
+                )
+                st.session_state["manual_import_preview"] = {
+                    "draft": draft,
+                    "raw": {
+                        "shift_hours": shift_hours,
+                        "education": education,
+                    },
                 }
-                inserted = tracker.add_job(job)
-                if inserted:
-                    st.success(f"Added job {inserted}: {title} at {employer}. Saved. Assessing...")
-                    try:
-                        job['id'] = inserted
-                        match_res = matcher.score_job(job)
-                        matcher.save_match(inserted, match_res)
-                        from agents.job_classifier import classify_evening_eligibility, classify_job
-                        ee = classify_evening_eligibility(job)
-                        cj = classify_job(job, matcher.load_profile())
-                        us = matcher.unified_suitability(job)
-                        st.write(f"Evening: {ee['status']} ({ee.get('evidence')})")
-                        st.write(f"Canadian: {cj['canadian_eligibility']['status']}")
-                        st.write(f"Skills: {us.get('skills_score')} Education: {us.get('education_score')}")
-                        st.write(f"Overall: {us.get('overall_score')} {us.get('category')}")
-                        if us.get('mandatory_gaps'):
-                            st.error("Mandatory gaps: " + "; ".join(us['mandatory_gaps']))
-                        st.info("Go to Recommended Jobs to view full assessment.")
-                    except Exception as e:
-                        st.error(f"Assessment failed: {e}")
+                st.rerun()
+            except (ManualImportError, ValueError) as e:
+                st.error(str(e))
+    else:
+        draft = st.session_state["manual_import_preview"]["draft"]
+        raw = st.session_state["manual_import_preview"]["raw"]
+        st.subheader("Preview — review before saving")
+        st.markdown(
+            "Columns marked **supplied** were entered by you. Classification rows "
+            "are computed by the existing pipeline and are **not** user-supplied."
+        )
+        st.write(
+            f"**Source platform:** {draft.get('source_platform') or 'manual — unknown'} "
+            "*(supplied)*"
+        )
+        st.write(f"**Original posting URL:** {draft['original_source_url']} *(supplied)*")
+        st.write(
+            f"**Employer application URL:** {draft.get('employer_application_url') or 'not provided'} "
+            "*(supplied)*"
+        )
+        st.write(
+            f"**External job ID:** {draft.get('external_job_id') or 'unknown — not detectable in this URL'} "
+            "*(extracted from the URL when the platform pattern is recognizable; never invented)*"
+        )
+        # Editable fields (corrections before confirm)
+        c_title = st.text_input("Job title", value=draft["job_title"], key="pv_title")
+        c_employer = st.text_input("Employer", value=draft["employer"], key="pv_employer")
+        c_location = st.text_input("Location", value=draft.get("location", ""), key="pv_location")
+        c_desc = st.text_area("Job description", value=draft["description"], height=200, key="pv_desc")
+        c_apply = st.text_input(
+            "Employer application URL",
+            value=draft.get("employer_application_url", ""),
+            key="pv_apply",
+        )
+        c_emp_type = st.text_input(
+            "Employment type", value=draft.get("employment_type", ""), key="pv_emp_type"
+        )
+        # Classification preview from the EXISTING pipeline (no DB writes)
+        try:
+            from agents.job_classifier import classify_evening_eligibility
+            preview_cls = classify_evening_eligibility({
+                "description": c_desc,
+                "location": c_location,
+                "remote": bool(c_location and "remote" in c_location.lower()),
+                "listing_status": "user_imported",
+                "shift": raw.get("shift_hours", ""),
+            })
+            st.write(
+                f"**Schedule classification:** {preview_cls['status']} — "
+                f"{preview_cls['reason']} *(computed, not user-supplied)*"
+            )
+        except Exception:
+            st.caption("Schedule classification unavailable for preview.")
+        col_back, col_confirm = st.columns(2)
+        if col_back.button("← Back to edit source fields", key="back_manual_job"):
+            del st.session_state["manual_import_preview"]
+            st.rerun()
+        if col_confirm.button("Confirm and Save Posting", key="confirm_manual_job"):
+            try:
+                # Re-validate corrected fields and rebuild via existing functions.
+                final_job = build_import_job(
+                    url=draft["original_source_url"],  # provenance preserved
+                    title=c_title,
+                    employer=c_employer,
+                    description=c_desc,
+                    location=c_location,
+                    employment_type=c_emp_type,
+                    shift_hours=raw.get("shift_hours", ""),
+                    education_required=raw.get("education", ""),
+                    employer_application_url=c_apply or None,
+                    platform=draft.get("source_platform") or None,
+                )
+                tracker = ApplicationTracker()
+                # Pre-save assertions (Stage 12.6.2): attribution, provenance and
+                # user-supplied status must survive rebuilding from the corrected
+                # preview fields.
+                if draft.get("source_platform"):
+                    assert final_job["source"] == draft["source_platform"]
+                assert final_job.get("original_source_url") == draft["original_source_url"]
+                assert final_job.get("source_verification_status") == "user_supplied"
+                assert (final_job.get("external_job_id") or "") == (draft.get("external_job_id") or "")
+                if tracker.job_exists(tracker.normalize_url(final_job["job_url"])):
+                    st.warning("Duplicate: this posting URL is already saved.")
                 else:
-                    st.warning("Duplicate or invalid job")
-    st.info("Manually imported jobs appear in Recommended Jobs with source 'manual'.")
+                    # Lock the save for the remainder of this run before any work
+                    # that could trigger a rerun with stale widget state — prevents
+                    # a double save from a single button press.
+                    st.session_state["manual_import_saving"] = True
+                    inserted = tracker.add_job(final_job)
+                    if inserted:
+                        st.success(
+                            f"✅ Saved job {inserted}: {final_job['job_title']} at "
+                            f"{final_job['employer']} (source: "
+                            f"{final_job['source_platform'] or 'manual'})."
+                        )
+                        try:
+                            final_job["id"] = inserted
+                            match_res = matcher.score_job(final_job)
+                            matcher.save_match(inserted, match_res)
+                            from agents.job_classifier import classify_job
+                            cj = classify_job(final_job, matcher.load_profile())
+                            us = matcher.unified_suitability(final_job)
+                            st.write(f"Canadian: {cj['canadian_eligibility']['status']}")
+                            st.write(f"Overall: {us.get('overall_score')} {us.get('category')}")
+                            if us.get("mandatory_gaps"):
+                                st.error("Mandatory gaps: " + "; ".join(us["mandatory_gaps"]))
+                            st.info("Go to Recommended Jobs to view full assessment.")
+                        except Exception as e:
+                            st.error(f"Assessment failed: {e}")
+                        # Prevent duplicate saves on rerun: clear the draft AFTER
+                        # the save + assessment so the next run shows the entry form.
+                        del st.session_state["manual_import_preview"]
+                        st.session_state["manual_import_saving"] = False
+                    else:
+                        st.session_state["manual_import_saving"] = False
+                        st.warning("Duplicate or invalid job")
+            except (ManualImportError, ValueError) as e:
+                st.session_state["manual_import_saving"] = False
+                st.error(str(e))
+    st.info(
+        "Manually imported jobs appear in Recommended Jobs with their platform "
+        "source (indeed / linkedin / manual). Schedule and eligibility stay "
+        "unverified until confirmed with the employer."
+    )
 
 
 elif page == "Settings":

@@ -27,6 +27,13 @@
       "status": "valid",
       "last_retrieved": 25,
       "last_checked": "2026-11-04T13:04:45.308-05:00"
+    },
+    {
+      "token": "okta",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 0,
+      "last_checked": ""
     }
   ],
   "lever_boards": [
@@ -36,6 +43,21 @@
       "status": "valid",
       "last_retrieved": 79,
       "last_checked": "2026-11-03T16:58:14.190168"
+    },
+    {
+      "token": "veeva",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 0,
+      "last_checked": ""
+    },
+    {
+      "token": "cologix",
+      "enabled": true,
+      "status": "valid",
+      "last_retrieved": 0,
+      "last_checked": ""
     }
-  ]
+  ],
+  "smartrecruiters_companies": []
 }

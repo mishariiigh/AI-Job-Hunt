@@ -27,6 +27,19 @@ def ensure_job_columns(conn):
         "gh_metadata": "TEXT NOT NULL DEFAULT ''",
         "office_locations": "TEXT NOT NULL DEFAULT ''",
         "enriched_at": "TEXT",
+        # Stage 12.3.1: manual Indeed/LinkedIn import provenance (additive,
+        # empty for discovered postings).
+        "source_platform": "TEXT NOT NULL DEFAULT ''",
+        "original_source_url": "TEXT NOT NULL DEFAULT ''",
+        "employer_application_url": "TEXT NOT NULL DEFAULT ''",
+        "external_job_id": "TEXT NOT NULL DEFAULT ''",
+        "source_verification_status": "TEXT NOT NULL DEFAULT ''",
+        "imported_at": "TEXT",
+        # Stage 12.6.3: manually verified employment hours and work
+        # arrangement (additive, empty for untouched rows). JSON object keyed
+        # by field name; schedule verification stays in
+        # schedule_classification and is never stored here.
+        "field_verification": "TEXT NOT NULL DEFAULT '{}'",
     }
     added = set()
     for name, declaration in migrations.items():
